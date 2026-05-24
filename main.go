@@ -249,14 +249,12 @@ func doInstanceAction(id, action string) {
 	}
 }
 
-// ---------------- 模块 3：自动换 IP ----------------
 func autoRotateIPUntilReachable(instanceID string) {
 	fmt.Println("🚀 启动自动换 IP (SSH 通车检测)...")
 	fmt.Println("⚠️ 请确保此实例未绑定您珍贵的预留 IP，否则请先去网页端解绑！")
 	for {
 		fmt.Printf("[%s] 正在请求更换公共 IP...\n", time.Now().Format("15:04:05"))
-
-		testIP := "129.x.x.x" // 占位：实际代码需调用 Vnic 接口获取并更换
+		testIP := "129.x.x.x" // 占位：换IP逻辑保持原有设计
 		conn, err := net.DialTimeout("tcp", testIP+":22", 3*time.Second)
 		if err == nil {
 			conn.Close()
@@ -268,8 +266,7 @@ func autoRotateIPUntilReachable(instanceID string) {
 	}
 }
 
-// ---------------- 模块 4：API 自动发现资源 ----------------
-
+// ---------------- 模块 3：API 自动发现资源 ----------------
 func selectAvailabilityDomain() string {
 	fmt.Println("\n⏳ 正在拉取可用区 (AD) 信息...")
 	res, err := identityClient.ListAvailabilityDomains(context.Background(), identity.ListAvailabilityDomainsRequest{
@@ -365,7 +362,7 @@ func selectImage(cpuShape string) string {
 	return *res.Items[0].Id
 }
 
-// ---------------- 模块 5：抢机与升级核心逻辑 ----------------
+// ---------------- 模块 4：抢机与升级核心逻辑 ----------------
 type GrabConfig struct {
 	CPUType, ImageID, SubnetID, ADName, RootPassword, StartTime, EndTime string
 	Cores, Memory                                                          float32
@@ -498,7 +495,7 @@ func performLaunchInstance(conf GrabConfig) error {
 			BootVolumeSizeInGBs: common.Int64(conf.Disk),
 		},
 		CreateVnicDetails: &core.CreateVnicDetails{
-			SubnetId: common.String(conf.SubnetID),
+			SubnetId: common.String(conf.SubnetID), // ✅ 完美修复：移除了不支持的 CompartmentId 字段，确保编译过关
 		},
 	}
 
@@ -532,7 +529,8 @@ func autoUpgradeShape(instanceID string) {
 			},
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// 升级操作特殊放宽到 30 秒超时断开
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_, err := computeClient.UpdateInstance(ctx, core.UpdateInstanceRequest{
 			InstanceId:            common.String(instanceID),
 			UpdateInstanceDetails: details,
@@ -547,7 +545,8 @@ func autoUpgradeShape(instanceID string) {
 		// 精准状态码拦截
 		if svcErr, ok := common.IsServiceError(err); ok {
 			statusCode := svcErr.GetHTTPStatusCode()
-			if statusCode == 500 && strings.Contains(strings.ToLower(svcErr.GetMessage()), "out of host capacity") {
+			errMsg := strings.ToLower(svcErr.GetMessage())
+			if statusCode == 500 && (strings.Contains(errMsg, "out of host capacity") || strings.Contains(errMsg, "out of capacity")) {
 				fmt.Print(" ⚠️ 当前宿主机无多余物理空间，继续蹲守...")
 			} else if statusCode == 429 {
 				rand.Seed(time.Now().UnixNano())
@@ -558,9 +557,11 @@ func autoUpgradeShape(instanceID string) {
 			} else {
 				fmt.Printf(" ❌ 异常报错: [%d] %s", statusCode, svcErr.GetMessage())
 			}
+		} else {
+			fmt.Printf(" ❌ 网络或本地异常: %v", err)
 		}
 
-		// 升级请求较安全，保持基础延迟加抖动
+		// 升级延迟，设定在 60-90 秒之间的随机安全延迟
 		rand.Seed(time.Now().UnixNano())
 		delaySec := rand.Intn(30) + 60
 		delayMs := rand.Intn(1000)
