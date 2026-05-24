@@ -6,3 +6,4 @@ oracle-tools
 直接把甲骨文的指纹文件复制粘贴,pem文件直接拖入
 <img width="1198" height="636" alt="image" src="https://github.com/user-attachments/assets/e2738fb1-8500-4f12-8773-b5f70030e6d8" />
 <img width="1267" height="541" alt="image" src="https://github.com/user-attachments/assets/a61c0612-775d-45f0-ac39-ec13f16cce5a" />
+<img width="1530" height="953" alt="image" src="https://github.com/user-attachments/assets/e68f4064-f554-4399-9e01-37e621a36c9f" />
