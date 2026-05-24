@@ -108,7 +108,7 @@ func initAuth() {
 	fingerprint := configMap["fingerprint"]
 
 	if tenancy == "" || user == "" || region == "" || fingerprint == "" {
-		log.Fatalf("❌ 解析失败：缺少必需的 API 参数 (tenancy/user/region/fingerprint)。")
+		log.Fatalf("❌ 解析失败：缺少必需的 API 参数。")
 	}
 
 	fmt.Print("\n📂 请将 key_file (.pem 文件) 拖入此窗口并回车: ")
@@ -120,13 +120,12 @@ func initAuth() {
 
 	config = common.NewRawConfigurationProvider(tenancy, user, region, fingerprint, string(keyBytes), nil)
 
-	// 初始化计算客户端
 	computeClient, err = core.NewComputeClientWithConfigurationProvider(config)
 	if err != nil {
 		log.Fatalf("❌ 计算客户端初始化失败: %v", err)
 	}
 
-	// 👑 探长级黑科技 1：动态指纹池与全套拟人 Header 注入
+	// 👑 探长级黑科技 1：动态指纹池与全套拟人 Header
 	uaPool := []string{
 		"Terraform/1.0.11", "Terraform/1.1.7", "Terraform/1.2.9",
 		"Oracle-CLI/3.20.0", "Oracle-CLI/3.22.1", "Oracle-CLI/3.23.0",
@@ -140,24 +139,45 @@ func initAuth() {
 		return nil
 	}
 
-	// 初始化网络与身份客户端
 	networkClient, err = core.NewVirtualNetworkClientWithConfigurationProvider(config)
-	if err != nil {
-		log.Fatalf("❌ 网络客户端初始化失败: %v", err)
-	}
-
 	identityClient, err = identity.NewIdentityClientWithConfigurationProvider(config)
-	if err != nil {
-		log.Fatalf("❌ 身份客户端初始化失败: %v", err)
-	}
 
 	compartmentID = tenancy
-	fmt.Println("✅ 身份验证已就绪，配置及私钥加载成功 (已开启高级指纹伪装)！")
+	fmt.Println("✅ 身份验证已就绪，配置及私钥加载成功 (已开启动态指纹伪装)！")
+}
+
+// ---------------- 辅助函数：通过网卡查询公网IP ----------------
+func getInstancePublicIP(instanceID string) string {
+	// 1. 获取机器挂载的虚拟网卡附件 (VnicAttachment)
+	req := core.ListVnicAttachmentsRequest{
+		CompartmentId: common.String(compartmentID),
+		InstanceId:    common.String(instanceID),
+	}
+	res, err := computeClient.ListVnicAttachments(context.Background(), req)
+	if err != nil || len(res.Items) == 0 {
+		return "获取中/无网卡"
+	}
+
+	// 2. 提取网卡 ID 并查询网卡详情
+	vnicID := res.Items[0].VnicId
+	vnicReq := core.GetVnicRequest{
+		VnicId: vnicID,
+	}
+	vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
+	if err != nil {
+		return "IP提取失败"
+	}
+
+	// 3. 返回公网 IP
+	if vnicRes.Vnic.PublicIp != nil {
+		return *vnicRes.Vnic.PublicIp
+	}
+	return "无公网IP"
 }
 
 // ---------------- 模块 2：实例管理 ----------------
 func instanceManagerMenu() {
-	fmt.Println("\n⏳ 正在拉取当前区域的实例列表，请稍候...")
+	fmt.Println("\n⏳ 正在拉取当前区域的实例与 IP 列表，请稍候...")
 
 	res, err := computeClient.ListInstances(context.Background(), core.ListInstancesRequest{
 		CompartmentId: common.String(compartmentID),
@@ -179,9 +199,12 @@ func instanceManagerMenu() {
 			fmt.Println("⚠️ 当前区域没有运行中或已停止的实例。")
 		} else {
 			for i, inst := range activeInstances {
+				// 👈 调用新增的 IP 查询函数
+				ipAddress := getInstancePublicIP(*inst.Id)
+				
 				fmt.Printf("[%d] %s | 状态: %s | 规格: %s\n",
 					i+1, *inst.DisplayName, inst.LifecycleState, *inst.Shape)
-				fmt.Printf("    ID: ...%s\n", (*inst.Id)[len(*inst.Id)-15:])
+				fmt.Printf("    IP: %s | ID: ...%s\n", ipAddress, (*inst.Id)[len(*inst.Id)-15:])
 			}
 		}
 	}
@@ -398,14 +421,18 @@ func grabInstanceMenu() {
 	}
 	readInput()
 
-	fmt.Print("🔑 开启 Root 密码？(y/n): ")
-	if readInput() == "y" {
-		fmt.Print("   设置密码 (留空随机生成): ")
-		conf.RootPassword = readInput()
-		if conf.RootPassword == "" {
-			conf.RootPassword = "OramanRoot2026!"
+	
+	// 新增：自动读取本地公钥文件
+	fmt.Print("📂 请拖入公钥文件 (.pub) 或直接回车跳过: ")
+	pubPath := strings.Trim(readInput(), `"'`)
+	if pubPath != "" {
+		keyContent, err := os.ReadFile(pubPath)
+		if err == nil {
+			conf.RootPassword = string(keyContent) // 复用字段存储公钥
+			fmt.Println("✅ 公钥已加载！")
 		}
 	}
+    // ... 后面的 CPU, AD, Subnet, Image 等选择逻辑保持不变 ...
 
 	fmt.Print("\n⏱️ 最小防封禁延迟(秒, 推荐 30): ")
 	fmt.Scanln(&conf.MinDelay)
@@ -448,7 +475,6 @@ func runTimedGrabLoop(conf GrabConfig) {
 			return
 		}
 
-		// 👑 探长级黑科技 2：精准 SDK 状态码拦截与风控退避
 		if svcErr, ok := common.IsServiceError(err); ok {
 			statusCode := svcErr.GetHTTPStatusCode()
 
@@ -456,9 +482,8 @@ func runTimedGrabLoop(conf GrabConfig) {
 				fmt.Print(" ⚠️ 区域物理空间不足 (500 无货)，持续蹲守...")
 
 			} else if statusCode == 429 || statusCode == 401 {
-				// 429 限流 或 401 (短时间鉴权超载)
 				rand.Seed(time.Now().UnixNano())
-				backoffSec := 60 + rand.Intn(15) // 动态退避 60~75秒
+				backoffSec := 60 + rand.Intn(15) 
 				backoffMs := rand.Intn(1000)
 				fmt.Printf("\n🛑 触发防刷风控 (状态码: %d)，启用深度蛰伏 %d.%03d 秒...", statusCode, backoffSec, backoffMs)
 				time.Sleep(time.Duration(backoffSec)*time.Second + time.Duration(backoffMs)*time.Millisecond)
@@ -471,7 +496,6 @@ func runTimedGrabLoop(conf GrabConfig) {
 			fmt.Printf(" ❌ 未知异常: %v", err)
 		}
 
-		// 毫秒级抖动防封 (打破傅里叶变换特征分析)
 		rand.Seed(time.Now().UnixNano())
 		delaySec := rand.Intn(conf.MaxDelay-conf.MinDelay+1) + conf.MinDelay
 		delayMs := rand.Intn(1000)
@@ -495,16 +519,21 @@ func performLaunchInstance(conf GrabConfig) error {
 			BootVolumeSizeInGBs: common.Int64(conf.Disk),
 		},
 		CreateVnicDetails: &core.CreateVnicDetails{
-			SubnetId: common.String(conf.SubnetID), // ✅ 完美修复：移除了不支持的 CompartmentId 字段，确保编译过关
+			SubnetId: common.String(conf.SubnetID),
 		},
 	}
 
-	if conf.RootPassword != "" {
+	// ✅ 这里做判断：如果存的是 ssh-rsa 开头的公钥，就注入 Metadata
+	if strings.HasPrefix(conf.RootPassword, "ssh-") {
+		details.Metadata = map[string]string{
+			"ssh_authorized_keys": conf.RootPassword,
+		}
+	} else if conf.RootPassword != "" {
+		// 如果不是公钥，还是走老办法：密码注入 (兼容旧逻辑)
 		script := fmt.Sprintf("#!/bin/bash\necho 'root:%s' | chpasswd\nsed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config\nsystemctl restart sshd", conf.RootPassword)
 		details.Metadata = map[string]string{"user_data": base64.StdEncoding.EncodeToString([]byte(script))}
 	}
 
-	// 👑 探长级黑科技 3：严格的 Context 超时控制防挂起 (15秒)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -529,7 +558,6 @@ func autoUpgradeShape(instanceID string) {
 			},
 		}
 
-		// 升级操作特殊放宽到 30 秒超时断开
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_, err := computeClient.UpdateInstance(ctx, core.UpdateInstanceRequest{
 			InstanceId:            common.String(instanceID),
@@ -542,7 +570,6 @@ func autoUpgradeShape(instanceID string) {
 			return
 		}
 
-		// 精准状态码拦截
 		if svcErr, ok := common.IsServiceError(err); ok {
 			statusCode := svcErr.GetHTTPStatusCode()
 			errMsg := strings.ToLower(svcErr.GetMessage())
@@ -561,7 +588,6 @@ func autoUpgradeShape(instanceID string) {
 			fmt.Printf(" ❌ 网络或本地异常: %v", err)
 		}
 
-		// 升级延迟，设定在 60-90 秒之间的随机安全延迟
 		rand.Seed(time.Now().UnixNano())
 		delaySec := rand.Intn(30) + 60
 		delayMs := rand.Intn(1000)
