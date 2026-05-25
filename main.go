@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -26,6 +27,10 @@ var (
 	config         common.ConfigurationProvider
 	compartmentID  string
 	reader         = bufio.NewReader(os.Stdin)
+
+	// 👑 风控追踪变量
+	lastFailTime    time.Time
+	consecutiveFail int
 )
 
 // 辅助函数：安全读取输入
@@ -84,7 +89,128 @@ func main() {
 	}
 }
 
-// ---------------- 模块 1：初始化认证 ----------------
+// ============ 👑 改进 1：IPv6 增强查询机制 ============
+func getInstanceIPs(instanceID string) (string, string) {
+	req := core.ListVnicAttachmentsRequest{
+		CompartmentId: common.String(compartmentID),
+		InstanceId:    common.String(instanceID),
+	}
+	res, err := computeClient.ListVnicAttachments(context.Background(), req)
+	if err != nil || len(res.Items) == 0 {
+		return "获取中/无网卡", "获取中/无网卡"
+	}
+
+	var ipv4List []string
+	var ipv6List []string
+
+	for _, attachment := range res.Items {
+		vnicID := attachment.VnicId
+		if vnicID == nil {
+			continue
+		}
+
+		// 【第一步】获取 VNIC 基本信息
+		vnicReq := core.GetVnicRequest{VnicId: vnicID}
+		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
+		if err != nil {
+			continue
+		}
+
+		// 提取 IPv4
+		if vnicRes.Vnic.PublicIp != nil && *vnicRes.Vnic.PublicIp != "" {
+			ipv4List = append(ipv4List, *vnicRes.Vnic.PublicIp)
+		}
+
+		// 【第二步】通过 ListIpv6s 查询 IPv6（主要方法）
+		// 使用超时上下文防止某些API操作挂住
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ipv6Res, err := networkClient.ListIpv6s(ctx, core.ListIpv6sRequest{
+			VnicId: vnicID,
+		})
+		cancel()
+
+		if err == nil && ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
+			for _, ipItem := range ipv6Res.Items {
+				if ipItem.IpAddress != nil && *ipItem.IpAddress != "" {
+					ipv6List = append(ipv6List, *ipItem.IpAddress)
+				}
+			}
+		}
+	}
+
+	// 【第三步】格式化输出
+	ipv4 := "无公网IPv4"
+	if len(ipv4List) > 0 {
+		ipv4 = strings.Join(ipv4List, ", ")
+	}
+
+	ipv6 := "无IPv6"
+	if len(ipv6List) > 0 {
+		ipv6 = strings.Join(ipv6List, ", ")
+	}
+
+	return ipv4, ipv6
+}
+
+// 👑 新增：查询所有 IPv6 地址详细信息
+func getAllInstanceIPDetails(instanceID string) {
+	fmt.Println("\n=== 📊 IP 地址详细信息 ===")
+	req := core.ListVnicAttachmentsRequest{
+		CompartmentId: common.String(compartmentID),
+		InstanceId:    common.String(instanceID),
+	}
+	res, err := computeClient.ListVnicAttachments(context.Background(), req)
+	if err != nil {
+		fmt.Printf("❌ 获取网卡列表失败: %v\n", err)
+		return
+	}
+
+	for i, attachment := range res.Items {
+		fmt.Printf("\n[网卡 %d]\n", i+1)
+		if attachment.VnicId == nil {
+			fmt.Println("  VNIC ID: 无")
+			continue
+		}
+		fmt.Printf("  VNIC ID: %s\n", *attachment.VnicId)
+
+		// 获取 VNIC 详情
+		vnicReq := core.GetVnicRequest{VnicId: attachment.VnicId}
+		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
+		if err != nil {
+			fmt.Printf("  ❌ 获取 VNIC 详情失败: %v\n", err)
+			continue
+		}
+
+		if vnicRes.Vnic.PublicIp != nil {
+			fmt.Printf("  公网 IPv4: %s\n", *vnicRes.Vnic.PublicIp)
+		} else {
+			fmt.Println("  公网 IPv4: 无")
+		}
+
+		if vnicRes.Vnic.PrivateIp != nil {
+			fmt.Printf("  私有 IPv4: %s\n", *vnicRes.Vnic.PrivateIp)
+		}
+
+		// 查询 IPv6 地址（改进版，带超时）
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ipv6Res, err := networkClient.ListIpv6s(ctx, core.ListIpv6sRequest{VnicId: attachment.VnicId})
+		cancel()
+
+		if err == nil && ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
+			fmt.Println("  IPv6 地址:")
+			for j, ipItem := range ipv6Res.Items {
+				if ipItem.IpAddress != nil {
+					fmt.Printf("    [%d] %s\n", j+1, *ipItem.IpAddress)
+				}
+			}
+		} else {
+			fmt.Println("  IPv6 地址: 无 (或查询超时)")
+		}
+	}
+	fmt.Println()
+}
+
+// ============ 初始化认证 ============
 func initAuth() {
 	configMap := make(map[string]string)
 	fmt.Println("\n=== 🔑 API 凭证配置 ===")
@@ -125,17 +251,20 @@ func initAuth() {
 		log.Fatalf("❌ 计算客户端初始化失败: %v", err)
 	}
 
-	// 👑 探长级黑科技 1：动态指纹池与全套拟人 Header
-	uaPool := []string{
-		"Terraform/1.0.11", "Terraform/1.1.7", "Terraform/1.2.9",
-		"Oracle-CLI/3.20.0", "Oracle-CLI/3.22.1", "Oracle-CLI/3.23.0",
+	// 👑 改进 2：更完善的 User-Agent 伪装
+	userAgentPool := []string{
+		"Terraform/1.0.11", "Terraform/1.1.7", "Terraform/1.2.9", "Terraform/1.3.0",
+		"Oracle-CLI/3.20.0", "Oracle-CLI/3.22.1", "Oracle-CLI/3.23.0", "Oracle-CLI/3.24.0",
+		"curl/7.64.1", "wget/1.20.3",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 	}
 	computeClient.Interceptor = func(req *http.Request) error {
-		rand.Seed(time.Now().UnixNano())
-		req.Header.Set("User-Agent", uaPool[rand.Intn(len(uaPool))])
+		req.Header.Set("User-Agent", userAgentPool[rand.Intn(len(userAgentPool))])
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Connection", "keep-alive")
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		// 👑 新增：反爬虫头
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("%d.%d.%d.%d", rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256)))
 		return nil
 	}
 
@@ -144,137 +273,6 @@ func initAuth() {
 
 	compartmentID = tenancy
 	fmt.Println("✅ 身份验证已就绪，配置及私钥加载成功 (已开启动态指纹伪装)！")
-}
-
-// 👑 修复：改进的 IPv6 查询函数 ----------------
-func getInstanceIPs(instanceID string) (string, string) {
-	req := core.ListVnicAttachmentsRequest{
-		CompartmentId: common.String(compartmentID),
-		InstanceId:    common.String(instanceID),
-	}
-	res, err := computeClient.ListVnicAttachments(context.Background(), req)
-	if err != nil || len(res.Items) == 0 {
-		return "获取中/无网卡", "获取中/无网卡"
-	}
-
-	var ipv4List []string
-	var ipv6List []string
-	var hasError bool
-
-	for _, attachment := range res.Items {
-		vnicID := attachment.VnicId
-		if vnicID == nil {
-			continue
-		}
-
-		// 【第一步】获取 VNIC 基本信息（包括 PublicIp）
-		vnicReq := core.GetVnicRequest{VnicId: vnicID}
-		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
-		if err != nil {
-			hasError = true
-			continue
-		}
-
-		// 提取 IPv4
-		if vnicRes.Vnic.PublicIp != nil && *vnicRes.Vnic.PublicIp != "" {
-			ipv4List = append(ipv4List, *vnicRes.Vnic.PublicIp)
-		}
-
-		// 【第二步】通过 ListIpv6s 主动查询 IPv6 地址（更可靠）
-		ipv6Req := core.ListIpv6sRequest{
-			VnicId: vnicID,
-		}
-		ipv6Res, err := networkClient.ListIpv6s(context.Background(), ipv6Req)
-		if err != nil {
-			hasError = true
-			// 继续下一个 VNIC，不中断循环
-			continue
-		}
-
-		if ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
-			for _, ipItem := range ipv6Res.Items {
-				if ipItem.IpAddress != nil && *ipItem.IpAddress != "" {
-					ipv6List = append(ipv6List, *ipItem.IpAddress)
-				}
-			}
-		}
-	}
-
-	// 【第三步】格式化输出结果
-	ipv4 := "无公网IPv4"
-	if len(ipv4List) > 0 {
-		ipv4 = strings.Join(ipv4List, ", ")
-	}
-
-	ipv6 := "无IPv6"
-	if len(ipv6List) > 0 {
-		ipv6 = strings.Join(ipv6List, ", ")
-	} else if hasError {
-		ipv6 = "查询中/失败"
-	}
-
-	return ipv4, ipv6
-}
-
-// 👑 修复：查询所有 IPv6 地址（用于调试）
-func getAllInstanceIPDetails(instanceID string) {
-	fmt.Println("\n=== 📊 IP 地址详细信息 ===")
-	req := core.ListVnicAttachmentsRequest{
-		CompartmentId: common.String(compartmentID),
-		InstanceId:    common.String(instanceID),
-	}
-	res, err := computeClient.ListVnicAttachments(context.Background(), req)
-	if err != nil {
-		fmt.Printf("❌ 获取网卡列表失败: %v\n", err)
-		return
-	}
-
-	for i, attachment := range res.Items {
-		fmt.Printf("\n[网卡 %d]\n", i+1)
-		if attachment.VnicId == nil {
-			fmt.Println("  VNIC ID: 无")
-			continue
-		}
-		fmt.Printf("  VNIC ID: %s\n", *attachment.VnicId)
-
-		// 获取 VNIC 详情
-		vnicReq := core.GetVnicRequest{VnicId: attachment.VnicId}
-		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
-		if err != nil {
-			fmt.Printf("  ❌ 获取 VNIC 详情失败: %v\n", err)
-			continue
-		}
-
-		if vnicRes.Vnic.PublicIp != nil {
-			fmt.Printf("  公网 IPv4: %s\n", *vnicRes.Vnic.PublicIp)
-		} else {
-			fmt.Println("  公网 IPv4: 无")
-		}
-
-		if vnicRes.Vnic.PrivateIp != nil {
-			fmt.Printf("  私有 IPv4: %s\n", *vnicRes.Vnic.PrivateIp)
-		}
-
-		// 查询 IPv6 地址
-		ipv6Req := core.ListIpv6sRequest{VnicId: attachment.VnicId}
-		ipv6Res, err := networkClient.ListIpv6s(context.Background(), ipv6Req)
-		if err != nil {
-			fmt.Printf("  ❌ 查询 IPv6 失败: %v\n", err)
-			continue
-		}
-
-		if ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
-			fmt.Println("  IPv6 地址:")
-			for j, ipItem := range ipv6Res.Items {
-				if ipItem.IpAddress != nil {
-					fmt.Printf("    [%d] %s\n", j+1, *ipItem.IpAddress)
-				}
-			}
-		} else {
-			fmt.Println("  IPv6 地址: 无")
-		}
-	}
-	fmt.Println()
 }
 
 // -------- 辅助函数：真正的轮换 IP API 逻辑 --------
@@ -566,20 +564,35 @@ func selectImage(cpuShape string) string {
 	return *res.Items[0].Id
 }
 
-// -------- 模块 4：抢机与升级核心逻辑 --------
+// ============ 👑 改进 3：风控感知的抢机配置与逻辑 ============
 type GrabConfig struct {
-	InstanceName                                                         string // 👈 新增：实例名称配置
+	InstanceName                                                         string
 	CPUType, ImageID, SubnetID, ADName, RootPassword, StartTime, EndTime string
 	Cores, Memory                                                        float32
 	Disk                                                                 int64
 	MinDelay, MaxDelay                                                   int
+	// 👑 新增：风控自适应参数
+	BaseDelayMs            int           // 基础延迟（毫秒）
+	RetryLimit             int           // 最大重试次数
+	ThrottleBackoffFactor  float64       // 风控退避倍数 (429/401时)
+	ResourceBackoffMin     int           // 资源不足时最小等待秒数
+	ResourceBackoffMax     int           // 资源不足时最大等待秒数
+	RequestTimeout         time.Duration // 单个请求超时时间
 }
 
 func grabInstanceMenu() {
-	conf := GrabConfig{}
+	conf := GrabConfig{
+		// 👑 风控默认参数
+		BaseDelayMs:           300,       // 基础300ms延迟
+		RetryLimit:            999,       // 无限重试
+		ThrottleBackoffFactor: 2.0,       // 429时翻倍退避
+		ResourceBackoffMin:    45,        // 资源不足时等45秒
+		ResourceBackoffMax:    120,       // 最多等120秒
+		RequestTimeout:        20 * time.Second,
+	}
+
 	fmt.Println("\n=== 🔧 抢机配置初始化 ===")
 
-	// 👈 新增：实例名称自定义输入
 	fmt.Print("📝 请输入抢机成功后的【实例名称】(直接回车默认 Oraman-Auto-Grabbed): ")
 	conf.InstanceName = readInput()
 	if conf.InstanceName == "" {
@@ -643,9 +656,29 @@ func grabInstanceMenu() {
 	runTimedGrabLoop(conf)
 }
 
+// 👑 改进：智能退避计算
+func calculateBackoff(retryCount int, isThrottled bool, isResourceExhausted bool) time.Duration {
+	if isThrottled {
+		// 429/401：指数退避 + 随机抖动
+		baseSec := math.Min(300, math.Pow(2, float64(retryCount))+float64(rand.Intn(30)))
+		return time.Duration(baseSec)*time.Second + time.Duration(rand.Intn(1000))*time.Millisecond
+	}
+
+	if isResourceExhausted {
+		// 500 + "out of capacity"：均匀随机等待
+		delaySec := 45 + rand.Intn(76) // 45-120秒
+		return time.Duration(delaySec)*time.Second + time.Duration(rand.Intn(1000))*time.Millisecond
+	}
+
+	// 其他错误：短延迟 + 随机
+	return time.Duration(100+rand.Intn(200))*time.Millisecond + time.Duration(rand.Intn(5))*time.Second
+}
+
 func runTimedGrabLoop(conf GrabConfig) {
 	loc, _ := time.LoadLocation("Asia/Shanghai")
-	for {
+	consecutiveFail = 0
+
+	for retryCount := 0; retryCount < conf.RetryLimit; retryCount++ {
 		now := time.Now().In(loc).Format("15:04")
 		if conf.StartTime != "" && (now < conf.StartTime || now > conf.EndTime) {
 			fmt.Printf("\r⏳ 等待时段 %s-%s (当前 %s)...", conf.StartTime, conf.EndTime, now)
@@ -653,7 +686,7 @@ func runTimedGrabLoop(conf GrabConfig) {
 			continue
 		}
 
-		fmt.Printf("\n[%s] 🚀 发起请求 (目标: %s)...", time.Now().Format("15:04:05"), conf.CPUType)
+		fmt.Printf("\n[%s] 🚀 发起请求 #%d (目标: %s)...", time.Now().Format("15:04:05"), retryCount+1, conf.CPUType)
 		err := performLaunchInstance(conf)
 
 		if err == nil {
@@ -661,40 +694,55 @@ func runTimedGrabLoop(conf GrabConfig) {
 			return
 		}
 
+		consecutiveFail++
+		isThrottled := false
+		isResourceExhausted := false
+
 		if svcErr, ok := common.IsServiceError(err); ok {
 			statusCode := svcErr.GetHTTPStatusCode()
+			errMsg := strings.ToLower(svcErr.GetMessage())
 
-			if statusCode == 500 && strings.Contains(strings.ToLower(svcErr.GetMessage()), "out of host capacity") {
-				fmt.Print(" ⚠️ 区域物理空间不足 (500 无货)，持续蹲守...")
+			if statusCode == 500 && (strings.Contains(errMsg, "out of host capacity") || strings.Contains(errMsg, "out of capacity")) {
+				fmt.Print(" ⚠️ 资源紧张 (500 无货)")
+				isResourceExhausted = true
 
-			} else if statusCode == 429 || statusCode == 401 {
-				rand.Seed(time.Now().UnixNano())
-				backoffSec := 60 + rand.Intn(15)
-				backoffMs := rand.Intn(1000)
-				fmt.Printf("\n🛑 触发防刷风控 (状态码: %d)，启用深度蛰伏 %d.%03d 秒...", statusCode, backoffSec, backoffMs)
-				time.Sleep(time.Duration(backoffSec)*time.Second + time.Duration(backoffMs)*time.Millisecond)
-				continue
+			} else if statusCode == 429 {
+				fmt.Printf(" 🛑 触发限流 (429) - 连续失败%d次", consecutiveFail)
+				isThrottled = true
+
+			} else if statusCode == 401 || statusCode == 403 {
+				fmt.Printf(" ❌ 认证失败 [%d]", statusCode)
+				isThrottled = true // 认证失败也当成风控处理
+
+			} else if statusCode == 400 {
+				fmt.Printf(" ⚠️ 请求格式错误 [%d]", statusCode)
+				// 400通常不是风控，可能是配置问题，使用短延迟
 
 			} else {
-				fmt.Printf(" ❌ 异常报错: [%d] %s", statusCode, svcErr.GetMessage())
+				fmt.Printf(" ❌ API错误 [%d] %s", statusCode, svcErr.GetMessage())
 			}
 		} else {
-			fmt.Printf(" ❌ 未知异常: %v", err)
+			fmt.Printf(" ❌ 网络异常: %v", err)
 		}
 
-		rand.Seed(time.Now().UnixNano())
-		delaySec := rand.Intn(conf.MaxDelay-conf.MinDelay+1) + conf.MinDelay
-		delayMs := rand.Intn(1000)
-		fmt.Printf("\n⏳ 伪装人类操作: 休眠 %d.%03d 秒...\n", delaySec, delayMs)
-		time.Sleep(time.Duration(delaySec)*time.Second + time.Duration(delayMs)*time.Millisecond)
+		backoff := calculateBackoff(consecutiveFail, isThrottled, isResourceExhausted)
+		fmt.Printf("\n⏳ 沉默中... %v\n", backoff)
+		time.Sleep(backoff)
+
+		// 👑 每成功一次请求就重置计数
+		if err == nil {
+			consecutiveFail = 0
+		}
 	}
+
+	fmt.Printf("❌ 达到最大重试次数 (%d)，抢机失败\n", conf.RetryLimit)
 }
 
 func performLaunchInstance(conf GrabConfig) error {
 	details := core.LaunchInstanceDetails{
 		AvailabilityDomain: common.String(conf.ADName),
 		CompartmentId:      common.String(compartmentID),
-		DisplayName:        common.String(conf.InstanceName), // 👈 修改：应用用户输入的实例名称
+		DisplayName:        common.String(conf.InstanceName),
 		Shape:              common.String(conf.CPUType),
 		ShapeConfig: &core.LaunchInstanceShapeConfigDetails{
 			Ocpus:       common.Float32(conf.Cores),
@@ -732,8 +780,10 @@ func autoUpgradeShape(instanceID string) {
 	fmt.Println("\n🚀 启动自动盲刷升级任务 (目标: 4核24G ARM)...")
 	fmt.Println("⚠️ 注意: 升级成功后实例会自动重启一次。请保持程序后台运行。")
 
-	for {
-		fmt.Printf("\n[%s] 正在向甲骨文提交配置升级请求...", time.Now().Format("15:04:05"))
+	consecutiveFail = 0
+
+	for retryCount := 0; retryCount < 9999; retryCount++ {
+		fmt.Printf("\n[%s] 正在向甲骨文提交配置升级请求 #%d...", time.Now().Format("15:04:05"), retryCount+1)
 
 		details := core.UpdateInstanceDetails{
 			Shape: common.String("VM.Standard.A1.Flex"),
@@ -755,28 +805,39 @@ func autoUpgradeShape(instanceID string) {
 			return
 		}
 
+		consecutiveFail++
+		isThrottled := false
+		isResourceExhausted := false
+
 		if svcErr, ok := common.IsServiceError(err); ok {
 			statusCode := svcErr.GetHTTPStatusCode()
 			errMsg := strings.ToLower(svcErr.GetMessage())
+
 			if statusCode == 500 && (strings.Contains(errMsg, "out of host capacity") || strings.Contains(errMsg, "out of capacity")) {
-				fmt.Print(" ⚠️ 当前宿主机无多余物理空间，继续蹲守...")
+				fmt.Print(" ⚠️ 资源紧张 (500 无货)")
+				isResourceExhausted = true
+
 			} else if statusCode == 429 {
-				rand.Seed(time.Now().UnixNano())
-				backoffSec, backoffMs := 60+rand.Intn(15), rand.Intn(1000)
-				fmt.Printf("\n🛑 触发风控 (429)，蛰伏 %d.%03d 秒...", backoffSec, backoffMs)
-				time.Sleep(time.Duration(backoffSec)*time.Second + time.Duration(backoffMs)*time.Millisecond)
-				continue
+				fmt.Printf(" 🛑 触发限流 (429) - 连续失败%d次", consecutiveFail)
+				isThrottled = true
+
+			} else if statusCode == 401 || statusCode == 403 {
+				fmt.Printf(" ❌ 认证失败 [%d]", statusCode)
+				isThrottled = true
+
 			} else {
-				fmt.Printf(" ❌ 异常报错: [%d] %s", statusCode, svcErr.GetMessage())
+				fmt.Printf(" ❌ API错误 [%d] %s", statusCode, svcErr.GetMessage())
 			}
 		} else {
-			fmt.Printf(" ❌ 网络或本地异常: %v", err)
+			fmt.Printf(" ❌ 网络异常: %v", err)
 		}
 
-		rand.Seed(time.Now().UnixNano())
-		delaySec := rand.Intn(30) + 60
-		delayMs := rand.Intn(1000)
-		fmt.Printf(" ⏳ 休息 %d.%03d 秒...", delaySec, delayMs)
-		time.Sleep(time.Duration(delaySec)*time.Second + time.Duration(delayMs)*time.Millisecond)
+		backoff := calculateBackoff(consecutiveFail, isThrottled, isResourceExhausted)
+		fmt.Printf(" ⏳ 休息 %v\n", backoff)
+		time.Sleep(backoff)
+
+		if err == nil {
+			consecutiveFail = 0
+		}
 	}
 }
