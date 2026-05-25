@@ -146,7 +146,7 @@ func initAuth() {
 	fmt.Println("✅ 身份验证已就绪，配置及私钥加载成功 (已开启动态指纹伪装)！")
 }
 
-// ---------------- 辅助函数：查询公网 IPv4 和 IPv6 ----------------
+// 👑 修复：改进的 IPv6 查询函数 ----------------
 func getInstanceIPs(instanceID string) (string, string) {
 	req := core.ListVnicAttachmentsRequest{
 		CompartmentId: common.String(compartmentID),
@@ -154,12 +154,12 @@ func getInstanceIPs(instanceID string) (string, string) {
 	}
 	res, err := computeClient.ListVnicAttachments(context.Background(), req)
 	if err != nil || len(res.Items) == 0 {
-		return "获取中/无网卡", "无"
+		return "获取中/无网卡", "获取中/无网卡"
 	}
 
 	var ipv4List []string
 	var ipv6List []string
-	var apiErrMark string
+	var hasError bool
 
 	for _, attachment := range res.Items {
 		vnicID := attachment.VnicId
@@ -167,32 +167,40 @@ func getInstanceIPs(instanceID string) (string, string) {
 			continue
 		}
 
+		// 【第一步】获取 VNIC 基本信息（包括 PublicIp）
 		vnicReq := core.GetVnicRequest{VnicId: vnicID}
 		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
-		if err == nil {
-			if vnicRes.Vnic.PublicIp != nil {
-				ipv4List = append(ipv4List, *vnicRes.Vnic.PublicIp)
-			}
-			if len(vnicRes.Vnic.Ipv6Addresses) > 0 {
-				ipv6List = append(ipv6List, vnicRes.Vnic.Ipv6Addresses...)
-			}
+		if err != nil {
+			hasError = true
+			continue
 		}
 
-		if len(ipv6List) == 0 {
-			ipv6Req := core.ListIpv6sRequest{VnicId: vnicID}
-			ipv6Res, err := networkClient.ListIpv6s(context.Background(), ipv6Req)
-			if err != nil {
-				apiErrMark = " (API查询被拒)"
-			} else {
-				for _, ipItem := range ipv6Res.Items {
-					if ipItem.IpAddress != nil {
-						ipv6List = append(ipv6List, *ipItem.IpAddress)
-					}
+		// 提取 IPv4
+		if vnicRes.Vnic.PublicIp != nil && *vnicRes.Vnic.PublicIp != "" {
+			ipv4List = append(ipv4List, *vnicRes.Vnic.PublicIp)
+		}
+
+		// 【第二步】通过 ListIpv6s 主动查询 IPv6 地址（更可靠）
+		ipv6Req := core.ListIpv6sRequest{
+			VnicId: vnicID,
+		}
+		ipv6Res, err := networkClient.ListIpv6s(context.Background(), ipv6Req)
+		if err != nil {
+			hasError = true
+			// 继续下一个 VNIC，不中断循环
+			continue
+		}
+
+		if ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
+			for _, ipItem := range ipv6Res.Items {
+				if ipItem.IpAddress != nil && *ipItem.IpAddress != "" {
+					ipv6List = append(ipv6List, *ipItem.IpAddress)
 				}
 			}
 		}
 	}
 
+	// 【第三步】格式化输出结果
 	ipv4 := "无公网IPv4"
 	if len(ipv4List) > 0 {
 		ipv4 = strings.Join(ipv4List, ", ")
@@ -201,16 +209,76 @@ func getInstanceIPs(instanceID string) (string, string) {
 	ipv6 := "无IPv6"
 	if len(ipv6List) > 0 {
 		ipv6 = strings.Join(ipv6List, ", ")
-	} else if apiErrMark != "" {
-		ipv6 = "无IPv6" + apiErrMark 
+	} else if hasError {
+		ipv6 = "查询中/失败"
 	}
 
 	return ipv4, ipv6
 }
 
-// ---------------- 辅助函数：真正的轮换 IP API 逻辑 ----------------
+// 👑 修复：查询所有 IPv6 地址（用于调试）
+func getAllInstanceIPDetails(instanceID string) {
+	fmt.Println("\n=== 📊 IP 地址详细信息 ===")
+	req := core.ListVnicAttachmentsRequest{
+		CompartmentId: common.String(compartmentID),
+		InstanceId:    common.String(instanceID),
+	}
+	res, err := computeClient.ListVnicAttachments(context.Background(), req)
+	if err != nil {
+		fmt.Printf("❌ 获取网卡列表失败: %v\n", err)
+		return
+	}
+
+	for i, attachment := range res.Items {
+		fmt.Printf("\n[网卡 %d]\n", i+1)
+		if attachment.VnicId == nil {
+			fmt.Println("  VNIC ID: 无")
+			continue
+		}
+		fmt.Printf("  VNIC ID: %s\n", *attachment.VnicId)
+
+		// 获取 VNIC 详情
+		vnicReq := core.GetVnicRequest{VnicId: attachment.VnicId}
+		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
+		if err != nil {
+			fmt.Printf("  ❌ 获取 VNIC 详情失败: %v\n", err)
+			continue
+		}
+
+		if vnicRes.Vnic.PublicIp != nil {
+			fmt.Printf("  公网 IPv4: %s\n", *vnicRes.Vnic.PublicIp)
+		} else {
+			fmt.Println("  公网 IPv4: 无")
+		}
+
+		if vnicRes.Vnic.PrivateIp != nil {
+			fmt.Printf("  私有 IPv4: %s\n", *vnicRes.Vnic.PrivateIp)
+		}
+
+		// 查询 IPv6 地址
+		ipv6Req := core.ListIpv6sRequest{VnicId: attachment.VnicId}
+		ipv6Res, err := networkClient.ListIpv6s(context.Background(), ipv6Req)
+		if err != nil {
+			fmt.Printf("  ❌ 查询 IPv6 失败: %v\n", err)
+			continue
+		}
+
+		if ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
+			fmt.Println("  IPv6 地址:")
+			for j, ipItem := range ipv6Res.Items {
+				if ipItem.IpAddress != nil {
+					fmt.Printf("    [%d] %s\n", j+1, *ipItem.IpAddress)
+				}
+			}
+		} else {
+			fmt.Println("  IPv6 地址: 无")
+		}
+	}
+	fmt.Println()
+}
+
+// -------- 辅助函数：真正的轮换 IP API 逻辑 --------
 func rotatePublicIP(instanceID string) (string, error) {
-	// 1. 获取网卡 ID
 	vnicReq := core.ListVnicAttachmentsRequest{
 		CompartmentId: common.String(compartmentID),
 		InstanceId:    common.String(instanceID),
@@ -221,7 +289,6 @@ func rotatePublicIP(instanceID string) (string, error) {
 	}
 	vnicID := vnicRes.Items[0].VnicId
 
-	// 2. 获取该网卡的私有 IP (Private IP) 记录
 	privReq := core.ListPrivateIpsRequest{VnicId: vnicID}
 	privRes, err := networkClient.ListPrivateIps(context.Background(), privReq)
 	if err != nil || len(privRes.Items) == 0 {
@@ -239,7 +306,6 @@ func rotatePublicIP(instanceID string) (string, error) {
 		primaryPrivIpID = privRes.Items[0].Id
 	}
 
-	// 3. 查找当前绑定的公网 IP 并删除它
 	pubReq := core.GetPublicIpByPrivateIpIdRequest{
 		GetPublicIpByPrivateIpIdDetails: core.GetPublicIpByPrivateIpIdDetails{
 			PrivateIpId: primaryPrivIpID,
@@ -255,10 +321,8 @@ func rotatePublicIP(instanceID string) (string, error) {
 		}
 	}
 
-	// 休息3秒给甲骨文后台同步时间
 	time.Sleep(3 * time.Second)
 
-	// 4. 创建并绑定一个全新的公网 IP
 	createReq := core.CreatePublicIpRequest{
 		CreatePublicIpDetails: core.CreatePublicIpDetails{
 			Lifetime:      core.CreatePublicIpDetailsLifetimeEphemeral,
@@ -277,7 +341,7 @@ func rotatePublicIP(instanceID string) (string, error) {
 	return "", fmt.Errorf("甲骨文未返回 IP 地址")
 }
 
-// ---------------- 模块 2：实例管理 ----------------
+// -------- 模块 2：实例管理 --------
 func instanceManagerMenu() {
 	fmt.Println("\n⏳ 正在拉取当前区域的实例与 IP 列表，请稍候...")
 
@@ -302,7 +366,7 @@ func instanceManagerMenu() {
 		} else {
 			for i, inst := range activeInstances {
 				ipv4, ipv6 := getInstanceIPs(*inst.Id)
-				
+
 				fmt.Printf("[%d] %s | 状态: %s | 规格: %s\n",
 					i+1, *inst.DisplayName, inst.LifecycleState, *inst.Shape)
 				fmt.Printf("    IPv4: %s\n    IPv6: %s\n    ID: ...%s\n", ipv4, ipv6, (*inst.Id)[len(*inst.Id)-15:])
@@ -334,6 +398,7 @@ func instanceManagerMenu() {
 	fmt.Println("3) 启动实例 (START)      4) 停止实例 (STOP)")
 	fmt.Println("5) 彻底删除 (TERMINATE)  6) 🔄 自动换 IP (盲刷到通为止)")
 	fmt.Println("7) 🚀 自动盲刷升级 (1核6G 升级为 4核24G ARM)")
+	fmt.Println("8) 📊 查看详细 IP 信息")
 	fmt.Print("请选择操作: ")
 
 	switch readInput() {
@@ -355,6 +420,8 @@ func instanceManagerMenu() {
 		autoRotateIPUntilReachable(insID)
 	case "7":
 		autoUpgradeShape(insID)
+	case "8":
+		getAllInstanceIPDetails(insID)
 	default:
 		fmt.Println("⚠️ 无效操作")
 	}
@@ -378,10 +445,9 @@ func autoRotateIPUntilReachable(instanceID string) {
 	fmt.Println("⚠️ 警告：请确保此实例未绑定您珍贵的【预留 IP】，否则会被直接删除！")
 	for {
 		fmt.Printf("\n[%s] 正在请求更换公共 IP...\n", time.Now().Format("15:04:05"))
-		
-		// 👈 这里调用刚刚写好的核心换 IP 逻辑
+
 		newIP, err := rotatePublicIP(instanceID)
-		
+
 		if err != nil {
 			fmt.Printf("❌ 更换失败: %v，10秒后重试...\n", err)
 			time.Sleep(10 * time.Second)
@@ -399,12 +465,12 @@ func autoRotateIPUntilReachable(instanceID string) {
 			fmt.Printf("✅ 通车！新 IP %s 完全可用，换 IP 任务结束。\n", newIP)
 			break
 		}
-		
+
 		fmt.Println("🚫 不通 (可能被墙或未开机)，准备再次更换...")
 	}
 }
 
-// ---------------- 模块 3：API 自动发现资源 ----------------
+// -------- 模块 3：API 自动发现资源 --------
 func selectAvailabilityDomain() string {
 	fmt.Println("\n⏳ 正在拉取可用区 (AD) 信息...")
 	res, err := identityClient.ListAvailabilityDomains(context.Background(), identity.ListAvailabilityDomainsRequest{
@@ -500,8 +566,9 @@ func selectImage(cpuShape string) string {
 	return *res.Items[0].Id
 }
 
-// ---------------- 模块 4：抢机与升级核心逻辑 ----------------
+// -------- 模块 4：抢机与升级核心逻辑 --------
 type GrabConfig struct {
+	InstanceName                                                         string // 👈 新增：实例名称配置
 	CPUType, ImageID, SubnetID, ADName, RootPassword, StartTime, EndTime string
 	Cores, Memory                                                        float32
 	Disk                                                                 int64
@@ -511,6 +578,13 @@ type GrabConfig struct {
 func grabInstanceMenu() {
 	conf := GrabConfig{}
 	fmt.Println("\n=== 🔧 抢机配置初始化 ===")
+
+	// 👈 新增：实例名称自定义输入
+	fmt.Print("📝 请输入抢机成功后的【实例名称】(直接回车默认 Oraman-Auto-Grabbed): ")
+	conf.InstanceName = readInput()
+	if conf.InstanceName == "" {
+		conf.InstanceName = "Oraman-Auto-Grabbed"
+	}
 
 	fmt.Print("🖥️ CPU [1:ARM(A1.Flex)  2:AMD(E2.1.Micro)]: ")
 	if readInput() == "1" {
@@ -541,7 +615,7 @@ func grabInstanceMenu() {
 	if pubPath != "" {
 		keyContent, err := os.ReadFile(pubPath)
 		if err == nil {
-			conf.RootPassword = string(keyContent) 
+			conf.RootPassword = string(keyContent)
 			fmt.Println("✅ 公钥已加载！")
 		}
 	}
@@ -620,7 +694,7 @@ func performLaunchInstance(conf GrabConfig) error {
 	details := core.LaunchInstanceDetails{
 		AvailabilityDomain: common.String(conf.ADName),
 		CompartmentId:      common.String(compartmentID),
-		DisplayName:        common.String("Oraman-Auto-Grabbed"),
+		DisplayName:        common.String(conf.InstanceName), // 👈 修改：应用用户输入的实例名称
 		Shape:              common.String(conf.CPUType),
 		ShapeConfig: &core.LaunchInstanceShapeConfigDetails{
 			Ocpus:       common.Float32(conf.Cores),
@@ -632,7 +706,7 @@ func performLaunchInstance(conf GrabConfig) error {
 		},
 		CreateVnicDetails: &core.CreateVnicDetails{
 			SubnetId:     common.String(conf.SubnetID),
-			AssignIpv6Ip: common.Bool(true), // 开启自动分配 IPv6 地址
+			AssignIpv6Ip: common.Bool(true),
 		},
 	}
 
