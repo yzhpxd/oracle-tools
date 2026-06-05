@@ -67,26 +67,29 @@ func main() {
 	// 2. 初始化 API 认证
 	initAuth()
 
-	// 3. 主菜单
-	for {
-		fmt.Println("\n====== 👑 主菜单 ======")
-		fmt.Println("1) 实例管理 (开关机 / 重启 / 彻底删除 / 换IP / 自动升级)")
-		fmt.Println("2) 自动抢机 (定时调度 / 随机延迟 / 防封禁 / 自动IPv6)")
-		fmt.Println("0) 退出")
-		fmt.Print("请选择 [1/2/0]: ")
+// 3. 主菜单
+    for {
+        fmt.Println("\n====== 👑 主菜单 ======")
+        fmt.Println("1) 实例管理 (开关机 / 重启 / 彻底删除 / 换IP / 自动升级)")
+        fmt.Println("2) 自动抢机 (定时调度 / 随机延迟 / 防封禁 / 自动IPv6)")
+        fmt.Println("3) VCN 安全控制 (放行 IPv4/IPv6 端口 / 配置公网路由) 🛡️") // 👈 新增：菜单选项
+        fmt.Println("0) 退出")
+        fmt.Print("请选择 [1/2/3/0]: ") // 👈 修改：加入了 3
 
-		switch readInput() {
-		case "1":
-			instanceManagerMenu()
-		case "2":
-			grabInstanceMenu()
-		case "0":
-			fmt.Println("👋 退出程序...")
-			os.Exit(0)
-		default:
-			fmt.Println("⚠️ 无效选择，请重新输入")
-		}
-	}
+        switch readInput() {
+        case "1":
+            instanceManagerMenu()
+        case "2":
+            grabInstanceMenu()
+        case "3":                 // 👈 新增：处理选项 3，调用安全模块
+            vcnSecurityMenu()
+        case "0":
+            fmt.Println("👋 退出程序...")
+            os.Exit(0)
+        default:
+            fmt.Println("⚠️ 无效选择，请重新输入")
+        }
+    }
 }
 
 // ============ 👑 改进 1：IPv6 增强查询机制 ============
@@ -840,4 +843,239 @@ func autoUpgradeShape(instanceID string) {
 			consecutiveFail = 0
 		}
 	}
+}
+// ============ 👑 模块 4：VCN 安全列表与路由表控制 ============
+
+func vcnSecurityMenu() {
+    fmt.Println("\n=== 🛡️ VCN 网络安全与路由控制 ===")
+    subnetID := selectSubnet()
+    if subnetID == "" || !strings.HasPrefix(subnetID, "ocid1.subnet.") {
+        fmt.Println("❌ 未选中有效的子网，操作取消。")
+        return
+    }
+
+    fmt.Println("\n--- ⚙️ 安全规则操作 ---")
+    fmt.Println("1) 🟢 追加放行端口 (安全追加，不影响现有规则)")
+    fmt.Println("2) 🔒 严格放行端口 (⚠️ 清空其他所有入站规则，仅留指定端口)")
+    fmt.Println("3) 🔴 一键全开端口协议 (高危，追加全开规则)")
+    fmt.Println("4) 🌍 修复公网路由 (自动添加 0.0.0.0/0 和 ::/0 到网关)")
+    fmt.Print("请选择操作 [1/2/3/4]: ")
+
+    choice := readInput()
+    switch choice {
+    case "1":
+        fmt.Print("👉 请输入要【追加】放行的 TCP 端口 (多个用空格或逗号隔开，如 22, 80, 443): ")
+        ports := parsePortInput(readInput())
+        if len(ports) > 0 {
+            updateSecurityList(subnetID, ports, "append")
+        } else {
+            fmt.Println("❌ 未检测到有效端口，操作取消")
+        }
+    case "2":
+        fmt.Print("⚠️ 警告：此操作将删除所有旧入站规则！\n👉 请输入要【唯一保留】的 TCP 端口 (多个用空格/逗号隔开，如 22 443): ")
+        ports := parsePortInput(readInput())
+        if len(ports) > 0 {
+            updateSecurityList(subnetID, ports, "strict")
+        } else {
+            fmt.Println("❌ 未检测到有效端口，操作取消")
+        }
+    case "3":
+        fmt.Print("⚠️ 确定要向全网开放所有端口吗？(y/n): ")
+        if readInput() == "y" {
+            updateSecurityList(subnetID, nil, "all")
+        }
+    case "4":
+        updateRouteTable(subnetID)
+    default:
+        fmt.Println("⚠️ 无效操作")
+    }
+}
+
+// 辅助函数：解析多端口输入 (支持空格、中英文逗号混合)
+func parsePortInput(input string) []int {
+    // 将常见的符号全部替换为空格，方便后续分割
+    input = strings.ReplaceAll(input, ",", " ")
+    input = strings.ReplaceAll(input, "，", " ")
+
+    var ports []int
+    parts := strings.Fields(input) // 按照空格自动分割
+    for _, p := range parts {
+        port, err := strconv.Atoi(p)
+        if err == nil && port >= 1 && port <= 65535 {
+            ports = append(ports, port)
+        } else {
+            fmt.Printf("⚠️ 警告：已自动跳过无效输入 '%s'\n", p)
+        }
+    }
+    return ports
+}
+
+// 核心功能：更新安全列表 (支持严格模式与多端口)
+func updateSecurityList(subnetID string, ports []int, mode string) {
+    ctx := context.Background()
+
+    // 1. 获取子网绑定的安全列表 ID
+    subReq := core.GetSubnetRequest{SubnetId: common.String(subnetID)}
+    subRes, err := networkClient.GetSubnet(ctx, subReq)
+    if err != nil || len(subRes.Subnet.SecurityListIds) == 0 {
+        fmt.Printf("❌ 获取子网信息或安全列表失败: %v\n", err)
+        return
+    }
+    secListID := subRes.Subnet.SecurityListIds[0]
+
+    // 2. 获取当前的安全列表规则
+    secReq := core.GetSecurityListRequest{SecurityListId: common.String(secListID)}
+    secRes, err := networkClient.GetSecurityList(ctx, secReq)
+    if err != nil {
+        fmt.Printf("❌ 读取现有安全列表失败: %v\n", err)
+        return
+    }
+
+    currentIngress := secRes.SecurityList.IngressSecurityRules
+    currentEgress := secRes.SecurityList.EgressSecurityRules // 出站规则我们始终不碰
+    var targetIngress []core.IngressSecurityRule
+
+    // 3. 根据模式构造目标入站规则
+    if mode == "all" {
+        newRules := []core.IngressSecurityRule{
+            {Source: common.String("0.0.0.0/0"), Protocol: common.String("all"), SourceType: core.IngressSecurityRuleSourceTypeCidrBlock},
+            {Source: common.String("::/0"), Protocol: common.String("all"), SourceType: core.IngressSecurityRuleSourceTypeCidrBlock},
+        }
+        targetIngress = append(currentIngress, newRules...)
+        fmt.Println("⏳ 正在为 IPv4 & IPv6 追加 [全开] 入站规则...")
+    } else {
+        // 遍历用户输入的每一个端口，分别为 IPv4 和 IPv6 创建规则
+        var portRules []core.IngressSecurityRule
+        for _, port := range ports {
+            portRules = append(portRules, core.IngressSecurityRule{
+                Source:   common.String("0.0.0.0/0"),
+                Protocol: common.String("6"), // TCP
+                TcpOptions: &core.TcpOptions{
+                    DestinationPortRange: &core.PortRange{Min: common.Int(port), Max: common.Int(port)},
+                },
+                SourceType: core.IngressSecurityRuleSourceTypeCidrBlock,
+            })
+            portRules = append(portRules, core.IngressSecurityRule{
+                Source:   common.String("::/0"),
+                Protocol: common.String("6"), // TCP
+                TcpOptions: &core.TcpOptions{
+                    DestinationPortRange: &core.PortRange{Min: common.Int(port), Max: common.Int(port)},
+                },
+                SourceType: core.IngressSecurityRuleSourceTypeCidrBlock,
+            })
+        }
+
+        if mode == "strict" {
+            // 👑 严格模式：丢弃历史规则，直接应用新规则
+            targetIngress = portRules
+            fmt.Printf("⏳ 正在清空旧规则，强制仅放行 TCP 端口 %v...\n", ports)
+        } else {
+            // 追加模式：合并
+            targetIngress = append(currentIngress, portRules...)
+            fmt.Printf("⏳ 正在为 IPv4 & IPv6 追加放行 TCP 端口规则 %v...\n", ports)
+        }
+    }
+
+    // 4. 推送更新给甲骨文
+    updateReq := core.UpdateSecurityListRequest{
+        SecurityListId: common.String(secListID),
+        UpdateSecurityListDetails: core.UpdateSecurityListDetails{
+            IngressSecurityRules: targetIngress,
+            EgressSecurityRules:  currentEgress, // 出站规则保持原样
+        },
+    }
+
+    _, err = networkClient.UpdateSecurityList(ctx, updateReq)
+    if err != nil {
+        fmt.Printf("❌ 安全列表更新失败: %v\n", err)
+    } else {
+        fmt.Println("✅ 安全列表更新成功！端口放行已生效。")
+    }
+}
+// 核心功能：配置网关与路由表
+func updateRouteTable(subnetID string) {
+    ctx := context.Background()
+
+    // 1. 获取子网，拿到 VcnId 和 RouteTableId
+    subReq := core.GetSubnetRequest{SubnetId: common.String(subnetID)}
+    subRes, err := networkClient.GetSubnet(ctx, subReq)
+    if err != nil {
+        fmt.Printf("❌ 获取子网信息失败: %v\n", err)
+        return
+    }
+    vcnID := *subRes.Subnet.VcnId
+    routeTableID := *subRes.Subnet.RouteTableId
+
+    // 2. 寻找当前 VCN 的 Internet Gateway (IGW)
+    fmt.Println("🔍 正在检索互联网网关 (IGW)...")
+    igwReq := core.ListInternetGatewaysRequest{
+        CompartmentId: common.String(compartmentID),
+        VcnId:         common.String(vcnID),
+    }
+    igwRes, err := networkClient.ListInternetGateways(ctx, igwReq)
+    if err != nil || len(igwRes.Items) == 0 {
+        fmt.Println("❌ 找不到互联网网关！请先在网页端为该 VCN 创建 Internet Gateway。")
+        return
+    }
+    igwID := *igwRes.Items[0].Id
+
+    // 3. 获取现有的路由规则 (已修复 RtId)
+    rtReq := core.GetRouteTableRequest{RtId: common.String(routeTableID)}
+    rtRes, err := networkClient.GetRouteTable(ctx, rtReq)
+    if err != nil {
+        fmt.Printf("❌ 读取路由表失败: %v\n", err)
+        return
+    }
+
+    currentRules := rtRes.RouteTable.RouteRules
+    hasIPv4, hasIPv6 := false, false
+
+    // 检查是否已存在路由
+    for _, rule := range currentRules {
+        if rule.Destination != nil {
+            if *rule.Destination == "0.0.0.0/0" {
+                hasIPv4 = true
+            } else if *rule.Destination == "::/0" {
+                hasIPv6 = true
+            }
+        }
+    }
+
+    if hasIPv4 && hasIPv6 {
+        fmt.Println("✅ 检测到路由表中已配置 IPv4 (0.0.0.0/0) 和 IPv6 (::/0) 的互联网网关路由，无需修改。")
+        return
+    }
+
+    // 4. 追加缺失的路由
+    if !hasIPv4 {
+        currentRules = append(currentRules, core.RouteRule{
+            NetworkEntityId: common.String(igwID),
+            Destination:     common.String("0.0.0.0/0"),
+            DestinationType: core.RouteRuleDestinationTypeCidrBlock,
+        })
+        fmt.Println("➕ 追加 IPv4 默认网关路由...")
+    }
+    if !hasIPv6 {
+        currentRules = append(currentRules, core.RouteRule{
+            NetworkEntityId: common.String(igwID),
+            Destination:     common.String("::/0"),
+            DestinationType: core.RouteRuleDestinationTypeCidrBlock,
+        })
+        fmt.Println("➕ 追加 IPv6 默认网关路由...")
+    }
+
+    // 5. 推送更新 (已修复 RtId)
+    updateReq := core.UpdateRouteTableRequest{
+        RtId: common.String(routeTableID),
+        UpdateRouteTableDetails: core.UpdateRouteTableDetails{
+            RouteRules: currentRules,
+        },
+    }
+
+    _, err = networkClient.UpdateRouteTable(ctx, updateReq)
+    if err != nil {
+        fmt.Printf("❌ 路由表更新失败: %v\n", err)
+    } else {
+        fmt.Println("✅ 路由表修复成功！网络出站及 IPv6 已指向公网。")
+    }
 }
