@@ -39,6 +39,24 @@ func readInput() string {
 	return strings.TrimSpace(str)
 }
 
+// 辅助函数：解析多端口输入 (支持空格、中英文逗号混合)
+func parsePortInput(input string) []int {
+	input = strings.ReplaceAll(input, ",", " ")
+	input = strings.ReplaceAll(input, "，", " ")
+
+	var ports []int
+	parts := strings.Fields(input)
+	for _, p := range parts {
+		port, err := strconv.Atoi(p)
+		if err == nil && port >= 1 && port <= 65535 {
+			ports = append(ports, port)
+		} else {
+			fmt.Printf("⚠️ 警告：已自动跳过无效输入 '%s'\n", p)
+		}
+	}
+	return ports
+}
+
 func main() {
 	fmt.Println("=========================================")
 	fmt.Println("  Oracle Cloud 自动化管理工具 (Win/Go)  ")
@@ -67,150 +85,29 @@ func main() {
 	// 2. 初始化 API 认证
 	initAuth()
 
-// 3. 主菜单
-    for {
-        fmt.Println("\n====== 👑 主菜单 ======")
-        fmt.Println("1) 实例管理 (开关机 / 重启 / 彻底删除 / 换IP / 自动升级)")
-        fmt.Println("2) 自动抢机 (定时调度 / 随机延迟 / 防封禁 / 自动IPv6)")
-        fmt.Println("3) VCN 安全控制 (放行 IPv4/IPv6 端口 / 配置公网路由) 🛡️") // 👈 新增：菜单选项
-        fmt.Println("0) 退出")
-        fmt.Print("请选择 [1/2/3/0]: ") // 👈 修改：加入了 3
+	// 3. 主菜单
+	for {
+		fmt.Println("\n====== 👑 主菜单 ======")
+		fmt.Println("1) 实例管理 (开关机 / 重启 / 彻底删除 / 换IP / 自动升级)")
+		fmt.Println("2) 自动抢机 (定时调度 / 随机延迟 / 防封禁 / 自动IPv6)")
+		fmt.Println("3) VCN 安全控制 (放行 IPv4/IPv6 端口 / 配置公网路由) 🛡️")
+		fmt.Println("0) 退出")
+		fmt.Print("请选择 [1/2/3/0]: ")
 
-        switch readInput() {
-        case "1":
-            instanceManagerMenu()
-        case "2":
-            grabInstanceMenu()
-        case "3":                 // 👈 新增：处理选项 3，调用安全模块
-            vcnSecurityMenu()
-        case "0":
-            fmt.Println("👋 退出程序...")
-            os.Exit(0)
-        default:
-            fmt.Println("⚠️ 无效选择，请重新输入")
-        }
-    }
-}
-
-// ============ 👑 改进 1：IPv6 增强查询机制 ============
-func getInstanceIPs(instanceID string) (string, string) {
-	req := core.ListVnicAttachmentsRequest{
-		CompartmentId: common.String(compartmentID),
-		InstanceId:    common.String(instanceID),
-	}
-	res, err := computeClient.ListVnicAttachments(context.Background(), req)
-	if err != nil || len(res.Items) == 0 {
-		return "获取中/无网卡", "获取中/无网卡"
-	}
-
-	var ipv4List []string
-	var ipv6List []string
-
-	for _, attachment := range res.Items {
-		vnicID := attachment.VnicId
-		if vnicID == nil {
-			continue
-		}
-
-		// 【第一步】获取 VNIC 基本信息
-		vnicReq := core.GetVnicRequest{VnicId: vnicID}
-		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
-		if err != nil {
-			continue
-		}
-
-		// 提取 IPv4
-		if vnicRes.Vnic.PublicIp != nil && *vnicRes.Vnic.PublicIp != "" {
-			ipv4List = append(ipv4List, *vnicRes.Vnic.PublicIp)
-		}
-
-		// 【第二步】通过 ListIpv6s 查询 IPv6（主要方法）
-		// 使用超时上下文防止某些API操作挂住
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		ipv6Res, err := networkClient.ListIpv6s(ctx, core.ListIpv6sRequest{
-			VnicId: vnicID,
-		})
-		cancel()
-
-		if err == nil && ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
-			for _, ipItem := range ipv6Res.Items {
-				if ipItem.IpAddress != nil && *ipItem.IpAddress != "" {
-					ipv6List = append(ipv6List, *ipItem.IpAddress)
-				}
-			}
+		switch readInput() {
+		case "1":
+			instanceManagerMenu()
+		case "2":
+			grabInstanceMenu()
+		case "3":
+			vcnSecurityMenu()
+		case "0":
+			fmt.Println("👋 退出程序...")
+			os.Exit(0)
+		default:
+			fmt.Println("⚠️ 无效选择，请重新输入")
 		}
 	}
-
-	// 【第三步】格式化输出
-	ipv4 := "无公网IPv4"
-	if len(ipv4List) > 0 {
-		ipv4 = strings.Join(ipv4List, ", ")
-	}
-
-	ipv6 := "无IPv6"
-	if len(ipv6List) > 0 {
-		ipv6 = strings.Join(ipv6List, ", ")
-	}
-
-	return ipv4, ipv6
-}
-
-// 👑 新增：查询所有 IPv6 地址详细信息
-func getAllInstanceIPDetails(instanceID string) {
-	fmt.Println("\n=== 📊 IP 地址详细信息 ===")
-	req := core.ListVnicAttachmentsRequest{
-		CompartmentId: common.String(compartmentID),
-		InstanceId:    common.String(instanceID),
-	}
-	res, err := computeClient.ListVnicAttachments(context.Background(), req)
-	if err != nil {
-		fmt.Printf("❌ 获取网卡列表失败: %v\n", err)
-		return
-	}
-
-	for i, attachment := range res.Items {
-		fmt.Printf("\n[网卡 %d]\n", i+1)
-		if attachment.VnicId == nil {
-			fmt.Println("  VNIC ID: 无")
-			continue
-		}
-		fmt.Printf("  VNIC ID: %s\n", *attachment.VnicId)
-
-		// 获取 VNIC 详情
-		vnicReq := core.GetVnicRequest{VnicId: attachment.VnicId}
-		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
-		if err != nil {
-			fmt.Printf("  ❌ 获取 VNIC 详情失败: %v\n", err)
-			continue
-		}
-
-		if vnicRes.Vnic.PublicIp != nil {
-			fmt.Printf("  公网 IPv4: %s\n", *vnicRes.Vnic.PublicIp)
-		} else {
-			fmt.Println("  公网 IPv4: 无")
-		}
-
-		if vnicRes.Vnic.PrivateIp != nil {
-			fmt.Printf("  私有 IPv4: %s\n", *vnicRes.Vnic.PrivateIp)
-		}
-
-		// 查询 IPv6 地址（改进版，带超时）
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		ipv6Res, err := networkClient.ListIpv6s(ctx, core.ListIpv6sRequest{VnicId: attachment.VnicId})
-		cancel()
-
-		if err == nil && ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
-			fmt.Println("  IPv6 地址:")
-			for j, ipItem := range ipv6Res.Items {
-				if ipItem.IpAddress != nil {
-					fmt.Printf("    [%d] %s\n", j+1, *ipItem.IpAddress)
-				}
-			}
-		} else {
-			fmt.Println("  IPv6 地址: 无 (或查询超时)")
-		}
-	}
-	fmt.Println()
 }
 
 // ============ 初始化认证 ============
@@ -254,7 +151,7 @@ func initAuth() {
 		log.Fatalf("❌ 计算客户端初始化失败: %v", err)
 	}
 
-	// 👑 改进 2：更完善的 User-Agent 伪装
+	// 更完善的 User-Agent 伪装
 	userAgentPool := []string{
 		"Terraform/1.0.11", "Terraform/1.1.7", "Terraform/1.2.9", "Terraform/1.3.0",
 		"Oracle-CLI/3.20.0", "Oracle-CLI/3.22.1", "Oracle-CLI/3.23.0", "Oracle-CLI/3.24.0",
@@ -266,7 +163,7 @@ func initAuth() {
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Connection", "keep-alive")
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-		// 👑 新增：反爬虫头
+		// 反爬虫头
 		req.Header.Set("X-Forwarded-For", fmt.Sprintf("%d.%d.%d.%d", rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256)))
 		return nil
 	}
@@ -278,7 +175,211 @@ func initAuth() {
 	fmt.Println("✅ 身份验证已就绪，配置及私钥加载成功 (已开启动态指纹伪装)！")
 }
 
-// -------- 辅助函数：真正的轮换 IP API 逻辑 --------
+// ============ IPv6 查询与 IP 获取 ============
+func getInstanceIPs(instanceID string) (string, string) {
+	req := core.ListVnicAttachmentsRequest{
+		CompartmentId: common.String(compartmentID),
+		InstanceId:    common.String(instanceID),
+	}
+	res, err := computeClient.ListVnicAttachments(context.Background(), req)
+	if err != nil || len(res.Items) == 0 {
+		return "获取中/无网卡", "获取中/无网卡"
+	}
+
+	var ipv4List []string
+	var ipv6List []string
+
+	for _, attachment := range res.Items {
+		vnicID := attachment.VnicId
+		if vnicID == nil {
+			continue
+		}
+
+		vnicReq := core.GetVnicRequest{VnicId: vnicID}
+		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
+		if err != nil {
+			continue
+		}
+
+		if vnicRes.Vnic.PublicIp != nil && *vnicRes.Vnic.PublicIp != "" {
+			ipv4List = append(ipv4List, *vnicRes.Vnic.PublicIp)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ipv6Res, err := networkClient.ListIpv6s(ctx, core.ListIpv6sRequest{
+			VnicId: vnicID,
+		})
+		cancel()
+
+		if err == nil && ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
+			for _, ipItem := range ipv6Res.Items {
+				if ipItem.IpAddress != nil && *ipItem.IpAddress != "" {
+					ipv6List = append(ipv6List, *ipItem.IpAddress)
+				}
+			}
+		}
+	}
+
+	ipv4 := "无公网IPv4"
+	if len(ipv4List) > 0 {
+		ipv4 = strings.Join(ipv4List, ", ")
+	}
+
+	ipv6 := "无IPv6"
+	if len(ipv6List) > 0 {
+		ipv6 = strings.Join(ipv6List, ", ")
+	}
+
+	return ipv4, ipv6
+}
+
+func getAllInstanceIPDetails(instanceID string) {
+	fmt.Println("\n=== 📊 IP 地址详细信息 ===")
+	req := core.ListVnicAttachmentsRequest{
+		CompartmentId: common.String(compartmentID),
+		InstanceId:    common.String(instanceID),
+	}
+	res, err := computeClient.ListVnicAttachments(context.Background(), req)
+	if err != nil {
+		fmt.Printf("❌ 获取网卡列表失败: %v\n", err)
+		return
+	}
+
+	for i, attachment := range res.Items {
+		fmt.Printf("\n[网卡 %d]\n", i+1)
+		if attachment.VnicId == nil {
+			fmt.Println("  VNIC ID: 无")
+			continue
+		}
+		fmt.Printf("  VNIC ID: %s\n", *attachment.VnicId)
+
+		vnicReq := core.GetVnicRequest{VnicId: attachment.VnicId}
+		vnicRes, err := networkClient.GetVnic(context.Background(), vnicReq)
+		if err != nil {
+			fmt.Printf("  ❌ 获取 VNIC 详情失败: %v\n", err)
+			continue
+		}
+
+		if vnicRes.Vnic.PublicIp != nil {
+			fmt.Printf("  公网 IPv4: %s\n", *vnicRes.Vnic.PublicIp)
+		} else {
+			fmt.Println("  公网 IPv4: 无")
+		}
+
+		if vnicRes.Vnic.PrivateIp != nil {
+			fmt.Printf("  私有 IPv4: %s\n", *vnicRes.Vnic.PrivateIp)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ipv6Res, err := networkClient.ListIpv6s(ctx, core.ListIpv6sRequest{VnicId: attachment.VnicId})
+		cancel()
+
+		if err == nil && ipv6Res.Items != nil && len(ipv6Res.Items) > 0 {
+			fmt.Println("  IPv6 地址:")
+			for j, ipItem := range ipv6Res.Items {
+				if ipItem.IpAddress != nil {
+					fmt.Printf("    [%d] %s\n", j+1, *ipItem.IpAddress)
+				}
+			}
+		} else {
+			fmt.Println("  IPv6 地址: 无 (或查询超时)")
+		}
+	}
+	fmt.Println()
+}
+
+// 核心功能：为实例检测并分配缺失的公网 IPv4 和 IPv6 地址
+func assignIPv4AndIPv6(instanceID string) {
+	fmt.Println("\n🚀 开始为实例检测并分配 IPv4 / IPv6 地址...")
+	ctx := context.Background()
+
+	// 1. 获取机器绑定的主网卡 (VNIC) 信息
+	vnicReq := core.ListVnicAttachmentsRequest{
+		CompartmentId: common.String(compartmentID),
+		InstanceId:    common.String(instanceID),
+	}
+	vnicRes, err := computeClient.ListVnicAttachments(ctx, vnicReq)
+	if err != nil || len(vnicRes.Items) == 0 {
+		fmt.Println("❌ 获取实例网卡失败，请确认实例是否正常运行。")
+		return
+	}
+	vnicID := vnicRes.Items[0].VnicId
+
+	// 2. 获取 VNIC 详情，拿到子网 ID 并检查当前 IPv4
+	vnicDetailReq := core.GetVnicRequest{VnicId: vnicID}
+	vnicDetailRes, err := networkClient.GetVnic(ctx, vnicDetailReq)
+	if err != nil {
+		fmt.Printf("❌ 获取 VNIC 详情失败: %v\n", err)
+		return
+	}
+	subnetID := vnicDetailRes.Vnic.SubnetId
+
+	// ---- 🟢 阶段一：分配公网 IPv4 ----
+	if vnicDetailRes.Vnic.PublicIp != nil && *vnicDetailRes.Vnic.PublicIp != "" {
+		fmt.Printf("✅ 实例已拥有公网 IPv4: %s，跳过分配。\n", *vnicDetailRes.Vnic.PublicIp)
+	} else {
+		fmt.Println("⏳ 检测到该网卡无公网 IPv4，正在尝试申请并绑定临时公网 IP...")
+		privReq := core.ListPrivateIpsRequest{VnicId: vnicID}
+		privRes, err := networkClient.ListPrivateIps(ctx, privReq)
+		if err == nil && len(privRes.Items) > 0 {
+			var primaryPrivIpID *string
+			for _, p := range privRes.Items {
+				if p.IsPrimary != nil && *p.IsPrimary {
+					primaryPrivIpID = p.Id
+					break
+				}
+			}
+			if primaryPrivIpID == nil {
+				primaryPrivIpID = privRes.Items[0].Id
+			}
+
+			createPubReq := core.CreatePublicIpRequest{
+				CreatePublicIpDetails: core.CreatePublicIpDetails{
+					Lifetime:      core.CreatePublicIpDetailsLifetimeEphemeral,
+					CompartmentId: common.String(compartmentID),
+					PrivateIpId:   primaryPrivIpID,
+				},
+			}
+			createPubRes, err := networkClient.CreatePublicIp(ctx, createPubReq)
+			if err != nil {
+				fmt.Printf("❌ 公网 IPv4 分配失败: %v\n", err)
+			} else if createPubRes.PublicIp.IpAddress != nil {
+				fmt.Printf("🎉 公网 IPv4 分配成功: %s\n", *createPubRes.PublicIp.IpAddress)
+			}
+		}
+	}
+
+	// ---- 🟣 阶段二：分配 IPv6 ----
+	subReq := core.GetSubnetRequest{SubnetId: subnetID}
+	subRes, err := networkClient.GetSubnet(ctx, subReq)
+	if err != nil || len(subRes.Subnet.Ipv6CidrBlocks) == 0 {
+		fmt.Println("\n❌ 无法分配 IPv6：该实例所在的底层子网尚未开启 IPv6 支持。")
+		fmt.Println("👉 解决方案：请先退回主菜单 -> 进入【3) VCN 安全控制】 -> 执行【5) 为 VCN 与子网开启 IPv6】，然后再回来重试！")
+		return
+	}
+
+	ipv6Req := core.ListIpv6sRequest{VnicId: vnicID}
+	ipv6Res, err := networkClient.ListIpv6s(ctx, ipv6Req)
+	if err == nil && len(ipv6Res.Items) > 0 {
+		fmt.Printf("✅ 实例已拥有 IPv6: %s，跳过分配。\n", *ipv6Res.Items[0].IpAddress)
+		return
+	}
+
+	fmt.Println("⏳ 检测到该网卡无 IPv6 地址，正在向子网请求分配...")
+	createIpv6Req := core.CreateIpv6Request{
+		CreateIpv6Details: core.CreateIpv6Details{
+			VnicId: vnicID,
+		},
+	}
+	createIpv6Res, err := networkClient.CreateIpv6(ctx, createIpv6Req)
+	if err != nil {
+		fmt.Printf("❌ IPv6 分配失败: %v\n", err)
+	} else if createIpv6Res.Ipv6.IpAddress != nil {
+		fmt.Printf("🎉 IPv6 分配成功: %s\n", *createIpv6Res.Ipv6.IpAddress)
+	}
+}
+
+// ============ 实例管理与换IP ============
 func rotatePublicIP(instanceID string) (string, error) {
 	vnicReq := core.ListVnicAttachmentsRequest{
 		CompartmentId: common.String(compartmentID),
@@ -342,7 +443,6 @@ func rotatePublicIP(instanceID string) (string, error) {
 	return "", fmt.Errorf("甲骨文未返回 IP 地址")
 }
 
-// -------- 模块 2：实例管理 --------
 func instanceManagerMenu() {
 	fmt.Println("\n⏳ 正在拉取当前区域的实例与 IP 列表，请稍候...")
 
@@ -400,6 +500,7 @@ func instanceManagerMenu() {
 	fmt.Println("5) 彻底删除 (TERMINATE)  6) 🔄 自动换 IP (盲刷到通为止)")
 	fmt.Println("7) 🚀 自动盲刷升级 (1核6G 升级为 4核24G ARM)")
 	fmt.Println("8) 📊 查看详细 IP 信息")
+	fmt.Println("9) 🌐 一键为实例分配公网 IPv4 与 IPv6 地址")
 	fmt.Print("请选择操作: ")
 
 	switch readInput() {
@@ -423,6 +524,8 @@ func instanceManagerMenu() {
 		autoUpgradeShape(insID)
 	case "8":
 		getAllInstanceIPDetails(insID)
+	case "9":
+		assignIPv4AndIPv6(insID)
 	default:
 		fmt.Println("⚠️ 无效操作")
 	}
@@ -471,7 +574,7 @@ func autoRotateIPUntilReachable(instanceID string) {
 	}
 }
 
-// -------- 模块 3：API 自动发现资源 --------
+// ============ API 自动发现资源 ============
 func selectAvailabilityDomain() string {
 	fmt.Println("\n⏳ 正在拉取可用区 (AD) 信息...")
 	res, err := identityClient.ListAvailabilityDomains(context.Background(), identity.ListAvailabilityDomainsRequest{
@@ -502,6 +605,94 @@ func selectAvailabilityDomain() string {
 	return *res.Items[0].Name
 }
 
+// 核心功能：一键初始化基础网络环境 (VCN + IGW + 路由 + 子网)
+func autoCreateNetwork() string {
+	fmt.Println("\n=== 🏗️ 开始荒野拓荒：初始化基础网络环境 ===")
+	fmt.Println("⏳ 1/4 正在为您创建全新的 VCN (网段 10.0.0.0/16)...")
+
+	ctx := context.Background()
+
+	// 1. 创建 VCN
+	vcnReq := core.CreateVcnRequest{
+		CreateVcnDetails: core.CreateVcnDetails{
+			CompartmentId: common.String(compartmentID),
+			DisplayName:   common.String("Oraman-Auto-VCN"),
+			CidrBlock:     common.String("10.0.0.0/16"),
+		},
+	}
+	vcnRes, err := networkClient.CreateVcn(ctx, vcnReq)
+	if err != nil {
+		fmt.Printf("❌ 创建 VCN 失败: %v\n", err)
+		return ""
+	}
+	vcnID := vcnRes.Vcn.Id
+	defaultRtID := vcnRes.Vcn.DefaultRouteTableId
+	fmt.Printf("✅ VCN 创建成功! ID: ...%s\n", (*vcnID)[len(*vcnID)-15:])
+
+	// 2. 创建 Internet Gateway (IGW)
+	fmt.Println("⏳ 2/4 正在创建并绑定互联网网关 (IGW)...")
+	igwReq := core.CreateInternetGatewayRequest{
+		CreateInternetGatewayDetails: core.CreateInternetGatewayDetails{
+			CompartmentId: common.String(compartmentID),
+			DisplayName:   common.String("Oraman-Auto-IGW"),
+			IsEnabled:     common.Bool(true),
+			VcnId:         vcnID,
+		},
+	}
+	igwRes, err := networkClient.CreateInternetGateway(ctx, igwReq)
+	if err != nil {
+		fmt.Printf("❌ 创建 IGW 失败: %v\n", err)
+		return ""
+	}
+	igwID := igwRes.InternetGateway.Id
+	fmt.Println("✅ 互联网网关创建成功!")
+
+	// 3. 配置默认路由表
+	fmt.Println("⏳ 3/4 正在配置默认路由表 (将 0.0.0.0/0 指向 IGW)...")
+	rtReq := core.UpdateRouteTableRequest{
+		RtId: defaultRtID,
+		UpdateRouteTableDetails: core.UpdateRouteTableDetails{
+			RouteRules: []core.RouteRule{
+				{
+					NetworkEntityId: igwID,
+					Destination:     common.String("0.0.0.0/0"),
+					DestinationType: core.RouteRuleDestinationTypeCidrBlock,
+				},
+			},
+		},
+	}
+	_, err = networkClient.UpdateRouteTable(ctx, rtReq)
+	if err != nil {
+		fmt.Printf("❌ 路由表更新失败: %v\n", err)
+	} else {
+		fmt.Println("✅ 路由表配置成功，公网已打通!")
+	}
+
+	// 4. 创建子网
+	fmt.Println("⏳ 4/4 正在划分默认子网 (网段 10.0.0.0/24)...")
+	subnetReq := core.CreateSubnetRequest{
+		CreateSubnetDetails: core.CreateSubnetDetails{
+			CompartmentId: common.String(compartmentID),
+			DisplayName:   common.String("Oraman-Auto-Subnet"),
+			VcnId:         vcnID,
+			CidrBlock:     common.String("10.0.0.0/24"),
+			RouteTableId:  defaultRtID,
+		},
+	}
+	
+	time.Sleep(2 * time.Second)
+	
+	subnetRes, err := networkClient.CreateSubnet(ctx, subnetReq)
+	if err != nil {
+		fmt.Printf("❌ 创建子网失败: %v\n", err)
+		return ""
+	} 
+	
+	newSubnetID := *subnetRes.Subnet.Id
+	fmt.Printf("🎉 基础网络初始化大功告成！子网已就绪。\n👉 新子网 OCID: %s\n", newSubnetID)
+	return newSubnetID
+}
+
 func selectSubnet() string {
 	fmt.Println("\n⏳ 正在拉取虚拟云网络 (VCN) 子网列表...")
 	res, err := networkClient.ListSubnets(context.Background(), core.ListSubnetsRequest{
@@ -509,7 +700,16 @@ func selectSubnet() string {
 	})
 
 	if err != nil || len(res.Items) == 0 {
-		fmt.Print("❌ 无法自动获取子网，请手动粘贴 Subnet OCID: ")
+		fmt.Println("⚠️ 当前区域没有任何子网 (疑似全新区域，无网络环境)。")
+		fmt.Print("👉 是否一键自动创建基础网络 (VCN + IGW + 路由 + 子网)？(y/n): ")
+		if readInput() == "y" {
+			newID := autoCreateNetwork()
+			if newID != "" {
+				return newID
+			}
+		}
+		
+		fmt.Print("❌ 自动建网已跳过或失败，请手动粘贴 Subnet OCID (或输入 0 退出): ")
 		return readInput()
 	}
 
@@ -567,30 +767,28 @@ func selectImage(cpuShape string) string {
 	return *res.Items[0].Id
 }
 
-// ============ 👑 改进 3：风控感知的抢机配置与逻辑 ============
+// ============ 风控感知的抢机配置与逻辑 ============
 type GrabConfig struct {
 	InstanceName                                                         string
 	CPUType, ImageID, SubnetID, ADName, RootPassword, StartTime, EndTime string
 	Cores, Memory                                                        float32
 	Disk                                                                 int64
 	MinDelay, MaxDelay                                                   int
-	// 👑 新增：风控自适应参数
-	BaseDelayMs            int           // 基础延迟（毫秒）
-	RetryLimit             int           // 最大重试次数
-	ThrottleBackoffFactor  float64       // 风控退避倍数 (429/401时)
-	ResourceBackoffMin     int           // 资源不足时最小等待秒数
-	ResourceBackoffMax     int           // 资源不足时最大等待秒数
-	RequestTimeout         time.Duration // 单个请求超时时间
+	BaseDelayMs                                                          int           
+	RetryLimit                                                           int           
+	ThrottleBackoffFactor                                                float64       
+	ResourceBackoffMin                                                   int           
+	ResourceBackoffMax                                                   int           
+	RequestTimeout                                                       time.Duration 
 }
 
 func grabInstanceMenu() {
 	conf := GrabConfig{
-		// 👑 风控默认参数
-		BaseDelayMs:           300,       // 基础300ms延迟
-		RetryLimit:            999,       // 无限重试
-		ThrottleBackoffFactor: 2.0,       // 429时翻倍退避
-		ResourceBackoffMin:    45,        // 资源不足时等45秒
-		ResourceBackoffMax:    120,       // 最多等120秒
+		BaseDelayMs:           300,
+		RetryLimit:            999,
+		ThrottleBackoffFactor: 2.0,
+		ResourceBackoffMin:    45,
+		ResourceBackoffMax:    120,
 		RequestTimeout:        20 * time.Second,
 	}
 
@@ -659,21 +857,17 @@ func grabInstanceMenu() {
 	runTimedGrabLoop(conf)
 }
 
-// 👑 改进：智能退避计算
 func calculateBackoff(retryCount int, isThrottled bool, isResourceExhausted bool) time.Duration {
 	if isThrottled {
-		// 429/401：指数退避 + 随机抖动
 		baseSec := math.Min(300, math.Pow(2, float64(retryCount))+float64(rand.Intn(30)))
 		return time.Duration(baseSec)*time.Second + time.Duration(rand.Intn(1000))*time.Millisecond
 	}
 
 	if isResourceExhausted {
-		// 500 + "out of capacity"：均匀随机等待
-		delaySec := 45 + rand.Intn(76) // 45-120秒
+		delaySec := 45 + rand.Intn(76)
 		return time.Duration(delaySec)*time.Second + time.Duration(rand.Intn(1000))*time.Millisecond
 	}
 
-	// 其他错误：短延迟 + 随机
 	return time.Duration(100+rand.Intn(200))*time.Millisecond + time.Duration(rand.Intn(5))*time.Second
 }
 
@@ -708,19 +902,14 @@ func runTimedGrabLoop(conf GrabConfig) {
 			if statusCode == 500 && (strings.Contains(errMsg, "out of host capacity") || strings.Contains(errMsg, "out of capacity")) {
 				fmt.Print(" ⚠️ 资源紧张 (500 无货)")
 				isResourceExhausted = true
-
 			} else if statusCode == 429 {
 				fmt.Printf(" 🛑 触发限流 (429) - 连续失败%d次", consecutiveFail)
 				isThrottled = true
-
 			} else if statusCode == 401 || statusCode == 403 {
 				fmt.Printf(" ❌ 认证失败 [%d]", statusCode)
-				isThrottled = true // 认证失败也当成风控处理
-
+				isThrottled = true
 			} else if statusCode == 400 {
 				fmt.Printf(" ⚠️ 请求格式错误 [%d]", statusCode)
-				// 400通常不是风控，可能是配置问题，使用短延迟
-
 			} else {
 				fmt.Printf(" ❌ API错误 [%d] %s", statusCode, svcErr.GetMessage())
 			}
@@ -732,7 +921,6 @@ func runTimedGrabLoop(conf GrabConfig) {
 		fmt.Printf("\n⏳ 沉默中... %v\n", backoff)
 		time.Sleep(backoff)
 
-		// 👑 每成功一次请求就重置计数
 		if err == nil {
 			consecutiveFail = 0
 		}
@@ -819,15 +1007,12 @@ func autoUpgradeShape(instanceID string) {
 			if statusCode == 500 && (strings.Contains(errMsg, "out of host capacity") || strings.Contains(errMsg, "out of capacity")) {
 				fmt.Print(" ⚠️ 资源紧张 (500 无货)")
 				isResourceExhausted = true
-
 			} else if statusCode == 429 {
 				fmt.Printf(" 🛑 触发限流 (429) - 连续失败%d次", consecutiveFail)
 				isThrottled = true
-
 			} else if statusCode == 401 || statusCode == 403 {
 				fmt.Printf(" ❌ 认证失败 [%d]", statusCode)
 				isThrottled = true
-
 			} else {
 				fmt.Printf(" ❌ API错误 [%d] %s", statusCode, svcErr.GetMessage())
 			}
@@ -844,238 +1029,342 @@ func autoUpgradeShape(instanceID string) {
 		}
 	}
 }
-// ============ 👑 模块 4：VCN 安全列表与路由表控制 ============
+
+// ============ VCN 安全列表与路由表控制 ============
 
 func vcnSecurityMenu() {
-    fmt.Println("\n=== 🛡️ VCN 网络安全与路由控制 ===")
-    subnetID := selectSubnet()
-    if subnetID == "" || !strings.HasPrefix(subnetID, "ocid1.subnet.") {
-        fmt.Println("❌ 未选中有效的子网，操作取消。")
-        return
-    }
+	fmt.Println("\n=== 🛡️ VCN 网络安全与路由控制 ===")
 
-    fmt.Println("\n--- ⚙️ 安全规则操作 ---")
-    fmt.Println("1) 🟢 追加放行端口 (安全追加，不影响现有规则)")
-    fmt.Println("2) 🔒 严格放行端口 (⚠️ 清空其他所有入站规则，仅留指定端口)")
-    fmt.Println("3) 🔴 一键全开端口协议 (高危，追加全开规则)")
-    fmt.Println("4) 🌍 修复公网路由 (自动添加 0.0.0.0/0 和 ::/0 到网关)")
-    fmt.Print("请选择操作 [1/2/3/4]: ")
+	subnetID := selectSubnet()
+	if subnetID == "" || !strings.HasPrefix(subnetID, "ocid1.subnet.") {
+		fmt.Println("❌ 未选中有效的子网，操作取消。")
+		return
+	}
 
-    choice := readInput()
-    switch choice {
-    case "1":
-        fmt.Print("👉 请输入要【追加】放行的 TCP 端口 (多个用空格或逗号隔开，如 22, 80, 443): ")
-        ports := parsePortInput(readInput())
-        if len(ports) > 0 {
-            updateSecurityList(subnetID, ports, "append")
-        } else {
-            fmt.Println("❌ 未检测到有效端口，操作取消")
-        }
-    case "2":
-        fmt.Print("⚠️ 警告：此操作将删除所有旧入站规则！\n👉 请输入要【唯一保留】的 TCP 端口 (多个用空格/逗号隔开，如 22 443): ")
-        ports := parsePortInput(readInput())
-        if len(ports) > 0 {
-            updateSecurityList(subnetID, ports, "strict")
-        } else {
-            fmt.Println("❌ 未检测到有效端口，操作取消")
-        }
-    case "3":
-        fmt.Print("⚠️ 确定要向全网开放所有端口吗？(y/n): ")
-        if readInput() == "y" {
-            updateSecurityList(subnetID, nil, "all")
-        }
-    case "4":
-        updateRouteTable(subnetID)
-    default:
-        fmt.Println("⚠️ 无效操作")
-    }
+	fmt.Println("\n--- ⚙️ 安全规则操作 ---")
+	fmt.Println("1) 🟢 追加放行端口 (安全追加，不影响现有规则)")
+	fmt.Println("2) 🔒 严格放行端口 (⚠️ 清空其他所有入站规则，仅留指定端口)")
+	fmt.Println("3) 🔴 一键全开端口协议 (高危，清空旧规则并双栈全开)")
+	fmt.Println("4) 🌍 修复公网路由 (自动添加 0.0.0.0/0 和 ::/0 到网关)")
+	fmt.Println("5) 🌐 为 VCN 与子网开启 IPv6 (底层环境初始化)")
+	fmt.Println("6) 🏗️ 荒野拓荒：一键初始化全新网络环境 (创建 VCN/子网/公网网关)")
+	fmt.Print("请选择操作 [1/2/3/4/5/6]: ")
+
+	choice := readInput()
+	switch choice {
+	case "1":
+		fmt.Print("👉 请输入要【追加】放行的 TCP 端口 (多个用空格或逗号隔开，如 22 80 443): ")
+		ports := parsePortInput(readInput())
+		if len(ports) > 0 {
+			updateSecurityList(subnetID, ports, "append")
+		} else {
+			fmt.Println("❌ 未检测到有效端口，操作取消")
+		}
+	case "2":
+		fmt.Print("⚠️ 警告：此操作将删除所有旧入站规则！\n👉 请输入要【唯一保留】的 TCP 端口: ")
+		ports := parsePortInput(readInput())
+		if len(ports) > 0 {
+			updateSecurityList(subnetID, ports, "strict")
+		} else {
+			fmt.Println("❌ 未检测到有效端口，操作取消")
+		}
+	case "3":
+		fmt.Print("⚠️ 确定要清空旧规则并向全网开放所有端口吗？(y/n): ")
+		if readInput() == "y" {
+			updateSecurityList(subnetID, nil, "all")
+		}
+	case "4":
+		updateRouteTable(subnetID)
+	case "5":
+		enableIPv6ForVCNAndSubnet(subnetID)
+	case "6":
+		autoCreateNetwork()
+	default:
+		fmt.Println("⚠️ 无效操作")
+	}
 }
 
-// 辅助函数：解析多端口输入 (支持空格、中英文逗号混合)
-func parsePortInput(input string) []int {
-    // 将常见的符号全部替换为空格，方便后续分割
-    input = strings.ReplaceAll(input, ",", " ")
-    input = strings.ReplaceAll(input, "，", " ")
-
-    var ports []int
-    parts := strings.Fields(input) // 按照空格自动分割
-    for _, p := range parts {
-        port, err := strconv.Atoi(p)
-        if err == nil && port >= 1 && port <= 65535 {
-            ports = append(ports, port)
-        } else {
-            fmt.Printf("⚠️ 警告：已自动跳过无效输入 '%s'\n", p)
-        }
-    }
-    return ports
-}
-
-// 核心功能：更新安全列表 (支持严格模式与多端口)
+// 核心功能：更新安全列表 (修复出站遗漏与旧规则未清空的问题)
 func updateSecurityList(subnetID string, ports []int, mode string) {
-    ctx := context.Background()
+	ctx := context.Background()
 
-    // 1. 获取子网绑定的安全列表 ID
-    subReq := core.GetSubnetRequest{SubnetId: common.String(subnetID)}
-    subRes, err := networkClient.GetSubnet(ctx, subReq)
-    if err != nil || len(subRes.Subnet.SecurityListIds) == 0 {
-        fmt.Printf("❌ 获取子网信息或安全列表失败: %v\n", err)
-        return
-    }
-    secListID := subRes.Subnet.SecurityListIds[0]
+	subReq := core.GetSubnetRequest{SubnetId: common.String(subnetID)}
+	subRes, err := networkClient.GetSubnet(ctx, subReq)
+	if err != nil || len(subRes.Subnet.SecurityListIds) == 0 {
+		fmt.Printf("❌ 获取子网信息或安全列表失败: %v\n", err)
+		return
+	}
+	secListID := subRes.Subnet.SecurityListIds[0]
+	vcnID := subRes.Subnet.VcnId
 
-    // 2. 获取当前的安全列表规则
-    secReq := core.GetSecurityListRequest{SecurityListId: common.String(secListID)}
-    secRes, err := networkClient.GetSecurityList(ctx, secReq)
-    if err != nil {
-        fmt.Printf("❌ 读取现有安全列表失败: %v\n", err)
-        return
-    }
+	hasIPv6 := false
+	if vcnID != nil {
+		vcnReq := core.GetVcnRequest{VcnId: vcnID}
+		vcnRes, vcnErr := networkClient.GetVcn(ctx, vcnReq)
+		if vcnErr == nil && len(vcnRes.Vcn.Ipv6CidrBlocks) > 0 {
+			hasIPv6 = true
+		}
+	}
 
-    currentIngress := secRes.SecurityList.IngressSecurityRules
-    currentEgress := secRes.SecurityList.EgressSecurityRules // 出站规则我们始终不碰
-    var targetIngress []core.IngressSecurityRule
+	secReq := core.GetSecurityListRequest{SecurityListId: common.String(secListID)}
+	secRes, err := networkClient.GetSecurityList(ctx, secReq)
+	if err != nil {
+		fmt.Printf("❌ 读取现有安全列表失败: %v\n", err)
+		return
+	}
 
-    // 3. 根据模式构造目标入站规则
-    if mode == "all" {
-        newRules := []core.IngressSecurityRule{
-            {Source: common.String("0.0.0.0/0"), Protocol: common.String("all"), SourceType: core.IngressSecurityRuleSourceTypeCidrBlock},
-            {Source: common.String("::/0"), Protocol: common.String("all"), SourceType: core.IngressSecurityRuleSourceTypeCidrBlock},
-        }
-        targetIngress = append(currentIngress, newRules...)
-        fmt.Println("⏳ 正在为 IPv4 & IPv6 追加 [全开] 入站规则...")
-    } else {
-        // 遍历用户输入的每一个端口，分别为 IPv4 和 IPv6 创建规则
-        var portRules []core.IngressSecurityRule
-        for _, port := range ports {
-            portRules = append(portRules, core.IngressSecurityRule{
-                Source:   common.String("0.0.0.0/0"),
-                Protocol: common.String("6"), // TCP
-                TcpOptions: &core.TcpOptions{
-                    DestinationPortRange: &core.PortRange{Min: common.Int(port), Max: common.Int(port)},
-                },
-                SourceType: core.IngressSecurityRuleSourceTypeCidrBlock,
-            })
-            portRules = append(portRules, core.IngressSecurityRule{
-                Source:   common.String("::/0"),
-                Protocol: common.String("6"), // TCP
-                TcpOptions: &core.TcpOptions{
-                    DestinationPortRange: &core.PortRange{Min: common.Int(port), Max: common.Int(port)},
-                },
-                SourceType: core.IngressSecurityRuleSourceTypeCidrBlock,
-            })
-        }
+	currentIngress := secRes.SecurityList.IngressSecurityRules
+	currentEgress := secRes.SecurityList.EgressSecurityRules
+	var targetIngress []core.IngressSecurityRule
+	var targetEgress []core.EgressSecurityRule
 
-        if mode == "strict" {
-            // 👑 严格模式：丢弃历史规则，直接应用新规则
-            targetIngress = portRules
-            fmt.Printf("⏳ 正在清空旧规则，强制仅放行 TCP 端口 %v...\n", ports)
-        } else {
-            // 追加模式：合并
-            targetIngress = append(currentIngress, portRules...)
-            fmt.Printf("⏳ 正在为 IPv4 & IPv6 追加放行 TCP 端口规则 %v...\n", ports)
-        }
-    }
+	// ---- 1. 处理入站规则 (Ingress) ----
+	if mode == "all" {
+		targetIngress = []core.IngressSecurityRule{
+			{Source: common.String("0.0.0.0/0"), Protocol: common.String("all"), SourceType: core.IngressSecurityRuleSourceTypeCidrBlock},
+		}
 
-    // 4. 推送更新给甲骨文
-    updateReq := core.UpdateSecurityListRequest{
-        SecurityListId: common.String(secListID),
-        UpdateSecurityListDetails: core.UpdateSecurityListDetails{
-            IngressSecurityRules: targetIngress,
-            EgressSecurityRules:  currentEgress, // 出站规则保持原样
-        },
-    }
+		if hasIPv6 {
+			targetIngress = append(targetIngress, core.IngressSecurityRule{Source: common.String("::/0"), Protocol: common.String("all"), SourceType: core.IngressSecurityRuleSourceTypeCidrBlock})
+			fmt.Println("⏳ 检测到 VCN 已开启 IPv6，正在清空旧规则，覆盖为双栈 [全开] 入站规则...")
+		} else {
+			fmt.Println("⏳ VCN 未开启 IPv6，正在清空旧规则，覆盖为 IPv4 [全开] 入站规则...")
+		}
+	} else {
+		var portRules []core.IngressSecurityRule
+		for _, port := range ports {
+			portRules = append(portRules, core.IngressSecurityRule{
+				Source:   common.String("0.0.0.0/0"),
+				Protocol: common.String("6"),
+				TcpOptions: &core.TcpOptions{DestinationPortRange: &core.PortRange{Min: common.Int(port), Max: common.Int(port)}},
+				SourceType: core.IngressSecurityRuleSourceTypeCidrBlock,
+			})
+			if hasIPv6 {
+				portRules = append(portRules, core.IngressSecurityRule{
+					Source:   common.String("::/0"),
+					Protocol: common.String("6"),
+					TcpOptions: &core.TcpOptions{DestinationPortRange: &core.PortRange{Min: common.Int(port), Max: common.Int(port)}},
+					SourceType: core.IngressSecurityRuleSourceTypeCidrBlock,
+				})
+			}
+		}
 
-    _, err = networkClient.UpdateSecurityList(ctx, updateReq)
-    if err != nil {
-        fmt.Printf("❌ 安全列表更新失败: %v\n", err)
-    } else {
-        fmt.Println("✅ 安全列表更新成功！端口放行已生效。")
-    }
+		if mode == "strict" {
+			targetIngress = portRules
+			if hasIPv6 {
+				fmt.Printf("⏳ 正在清空旧规则，强制放行双栈 TCP 端口 %v...\n", ports)
+			} else {
+				fmt.Printf("⏳ 正在清空旧规则，强制放行 IPv4 TCP 端口 %v...\n", ports)
+			}
+		} else {
+			targetIngress = append(currentIngress, portRules...)
+			if len(ports) > 0 {
+				fmt.Printf("⏳ 正在追加放行 TCP 端口规则 %v...\n", ports)
+			}
+		}
+	}
+
+	// ---- 2. 处理出站规则 (Egress) ----
+	if mode == "all" || mode == "strict" {
+		targetEgress = []core.EgressSecurityRule{
+			{Destination: common.String("0.0.0.0/0"), Protocol: common.String("all"), DestinationType: core.EgressSecurityRuleDestinationTypeCidrBlock},
+		}
+		if hasIPv6 {
+			targetEgress = append(targetEgress, core.EgressSecurityRule{
+				Destination: common.String("::/0"), Protocol: common.String("all"), DestinationType: core.EgressSecurityRuleDestinationTypeCidrBlock,
+			})
+		}
+	} else {
+		targetEgress = currentEgress
+		hasV4E, hasV6E := false, false
+		for _, r := range targetEgress {
+			if r.Destination != nil {
+				if *r.Destination == "0.0.0.0/0" && *r.Protocol == "all" { hasV4E = true }
+				if *r.Destination == "::/0" && *r.Protocol == "all" { hasV6E = true }
+			}
+		}
+		if !hasV4E {
+			targetEgress = append(targetEgress, core.EgressSecurityRule{
+				Destination: common.String("0.0.0.0/0"), Protocol: common.String("all"), DestinationType: core.EgressSecurityRuleDestinationTypeCidrBlock,
+			})
+			fmt.Println("➕ 自动补齐 IPv4 出站全开规则...")
+		}
+		if hasIPv6 && !hasV6E {
+			targetEgress = append(targetEgress, core.EgressSecurityRule{
+				Destination: common.String("::/0"), Protocol: common.String("all"), DestinationType: core.EgressSecurityRuleDestinationTypeCidrBlock,
+			})
+			fmt.Println("➕ 自动补齐 IPv6 出站全开规则...")
+		}
+	}
+
+	updateReq := core.UpdateSecurityListRequest{
+		SecurityListId: common.String(secListID),
+		UpdateSecurityListDetails: core.UpdateSecurityListDetails{
+			IngressSecurityRules: targetIngress,
+			EgressSecurityRules:  targetEgress,
+		},
+	}
+
+	_, err = networkClient.UpdateSecurityList(ctx, updateReq)
+	if err != nil {
+		fmt.Printf("❌ 安全列表更新失败: %v\n", err)
+	} else {
+		fmt.Println("✅ 安全列表更新成功！端口规则已完全同步。")
+	}
 }
+
 // 核心功能：配置网关与路由表
 func updateRouteTable(subnetID string) {
-    ctx := context.Background()
+	ctx := context.Background()
 
-    // 1. 获取子网，拿到 VcnId 和 RouteTableId
-    subReq := core.GetSubnetRequest{SubnetId: common.String(subnetID)}
-    subRes, err := networkClient.GetSubnet(ctx, subReq)
-    if err != nil {
-        fmt.Printf("❌ 获取子网信息失败: %v\n", err)
-        return
-    }
-    vcnID := *subRes.Subnet.VcnId
-    routeTableID := *subRes.Subnet.RouteTableId
+	subReq := core.GetSubnetRequest{SubnetId: common.String(subnetID)}
+	subRes, err := networkClient.GetSubnet(ctx, subReq)
+	if err != nil {
+		fmt.Printf("❌ 获取子网信息失败: %v\n", err)
+		return
+	}
+	vcnID := *subRes.Subnet.VcnId
+	routeTableID := *subRes.Subnet.RouteTableId
 
-    // 2. 寻找当前 VCN 的 Internet Gateway (IGW)
-    fmt.Println("🔍 正在检索互联网网关 (IGW)...")
-    igwReq := core.ListInternetGatewaysRequest{
-        CompartmentId: common.String(compartmentID),
-        VcnId:         common.String(vcnID),
-    }
-    igwRes, err := networkClient.ListInternetGateways(ctx, igwReq)
-    if err != nil || len(igwRes.Items) == 0 {
-        fmt.Println("❌ 找不到互联网网关！请先在网页端为该 VCN 创建 Internet Gateway。")
-        return
-    }
-    igwID := *igwRes.Items[0].Id
+	hasIPv6 := false
+	vcnReq := core.GetVcnRequest{VcnId: common.String(vcnID)}
+	vcnRes, _ := networkClient.GetVcn(ctx, vcnReq)
+	if len(vcnRes.Vcn.Ipv6CidrBlocks) > 0 {
+		hasIPv6 = true
+	}
 
-    // 3. 获取现有的路由规则 (已修复 RtId)
-    rtReq := core.GetRouteTableRequest{RtId: common.String(routeTableID)}
-    rtRes, err := networkClient.GetRouteTable(ctx, rtReq)
-    if err != nil {
-        fmt.Printf("❌ 读取路由表失败: %v\n", err)
-        return
-    }
+	fmt.Println("🔍 正在检索互联网网关 (IGW)...")
+	igwReq := core.ListInternetGatewaysRequest{
+		CompartmentId: common.String(compartmentID),
+		VcnId:         common.String(vcnID),
+	}
+	igwRes, err := networkClient.ListInternetGateways(ctx, igwReq)
+	if err != nil || len(igwRes.Items) == 0 {
+		fmt.Println("❌ 找不到互联网网关！请先在网页端为该 VCN 创建 Internet Gateway。")
+		return
+	}
+	igwID := *igwRes.Items[0].Id
 
-    currentRules := rtRes.RouteTable.RouteRules
-    hasIPv4, hasIPv6 := false, false
+	rtReq := core.GetRouteTableRequest{RtId: common.String(routeTableID)}
+	rtRes, err := networkClient.GetRouteTable(ctx, rtReq)
+	if err != nil {
+		fmt.Printf("❌ 读取路由表失败: %v\n", err)
+		return
+	}
 
-    // 检查是否已存在路由
-    for _, rule := range currentRules {
-        if rule.Destination != nil {
-            if *rule.Destination == "0.0.0.0/0" {
-                hasIPv4 = true
-            } else if *rule.Destination == "::/0" {
-                hasIPv6 = true
-            }
-        }
-    }
+	currentRules := rtRes.RouteTable.RouteRules
+	hasIPv4Rt, hasIPv6Rt := false, false
 
-    if hasIPv4 && hasIPv6 {
-        fmt.Println("✅ 检测到路由表中已配置 IPv4 (0.0.0.0/0) 和 IPv6 (::/0) 的互联网网关路由，无需修改。")
-        return
-    }
+	for _, rule := range currentRules {
+		if rule.Destination != nil {
+			if *rule.Destination == "0.0.0.0/0" { hasIPv4Rt = true }
+			if *rule.Destination == "::/0" { hasIPv6Rt = true }
+		}
+	}
 
-    // 4. 追加缺失的路由
-    if !hasIPv4 {
-        currentRules = append(currentRules, core.RouteRule{
-            NetworkEntityId: common.String(igwID),
-            Destination:     common.String("0.0.0.0/0"),
-            DestinationType: core.RouteRuleDestinationTypeCidrBlock,
-        })
-        fmt.Println("➕ 追加 IPv4 默认网关路由...")
-    }
-    if !hasIPv6 {
-        currentRules = append(currentRules, core.RouteRule{
-            NetworkEntityId: common.String(igwID),
-            Destination:     common.String("::/0"),
-            DestinationType: core.RouteRuleDestinationTypeCidrBlock,
-        })
-        fmt.Println("➕ 追加 IPv6 默认网关路由...")
-    }
+	needUpdate := false
+	if !hasIPv4Rt {
+		currentRules = append(currentRules, core.RouteRule{
+			NetworkEntityId: common.String(igwID), Destination: common.String("0.0.0.0/0"), DestinationType: core.RouteRuleDestinationTypeCidrBlock,
+		})
+		fmt.Println("➕ 追加 IPv4 默认网关路由...")
+		needUpdate = true
+	}
+	if hasIPv6 && !hasIPv6Rt {
+		currentRules = append(currentRules, core.RouteRule{
+			NetworkEntityId: common.String(igwID), Destination: common.String("::/0"), DestinationType: core.RouteRuleDestinationTypeCidrBlock,
+		})
+		fmt.Println("➕ 追加 IPv6 默认网关路由...")
+		needUpdate = true
+	}
 
-    // 5. 推送更新 (已修复 RtId)
-    updateReq := core.UpdateRouteTableRequest{
-        RtId: common.String(routeTableID),
-        UpdateRouteTableDetails: core.UpdateRouteTableDetails{
-            RouteRules: currentRules,
-        },
-    }
+	if !needUpdate {
+		fmt.Println("✅ 路由表中已配置好正确的网关路由，无需修改。")
+		return
+	}
 
-    _, err = networkClient.UpdateRouteTable(ctx, updateReq)
-    if err != nil {
-        fmt.Printf("❌ 路由表更新失败: %v\n", err)
-    } else {
-        fmt.Println("✅ 路由表修复成功！网络出站及 IPv6 已指向公网。")
-    }
+	updateReq := core.UpdateRouteTableRequest{
+		RtId: common.String(routeTableID),
+		UpdateRouteTableDetails: core.UpdateRouteTableDetails{RouteRules: currentRules},
+	}
+	_, err = networkClient.UpdateRouteTable(ctx, updateReq)
+	if err != nil {
+		fmt.Printf("❌ 路由表更新失败: %v\n", err)
+	} else {
+		fmt.Println("✅ 路由表修复成功！网络出站及 IPv6 已指向公网。")
+	}
+}
+
+// 核心功能：一键为 VCN 和子网分配 IPv6 (新增自动配置路由逻辑)
+func enableIPv6ForVCNAndSubnet(subnetID string) {
+	fmt.Println("\n=== 🌐 一键开启 VCN 与子网 IPv6 ===")
+
+	ctx := context.Background()
+
+	subReq := core.GetSubnetRequest{SubnetId: common.String(subnetID)}
+	subRes, err := networkClient.GetSubnet(ctx, subReq)
+	if err != nil {
+		fmt.Printf("❌ 获取子网信息失败: %v\n", err)
+		return
+	}
+	vcnID := subRes.Subnet.VcnId
+
+	vcnReq := core.GetVcnRequest{VcnId: vcnID}
+	vcnRes, err := networkClient.GetVcn(ctx, vcnReq)
+	if err != nil {
+		fmt.Printf("❌ 获取 VCN 信息失败: %v\n", err)
+		return
+	}
+
+	var vcnIPv6Prefix string
+	if len(vcnRes.Vcn.Ipv6CidrBlocks) > 0 {
+		vcnIPv6Prefix = vcnRes.Vcn.Ipv6CidrBlocks[0]
+		fmt.Printf("✅ VCN 已开启 IPv6，前缀为: %s\n", vcnIPv6Prefix)
+	} else {
+		fmt.Println("⏳ 正在向 Oracle 申请免费的 IPv6 CIDR (/56) 分配给 VCN...")
+
+		addReq := core.AddIpv6VcnCidrRequest{VcnId: vcnID}
+		_, err = networkClient.AddIpv6VcnCidr(ctx, addReq)
+		if err != nil {
+			fmt.Printf("❌ 无法为 VCN 分配 IPv6: %v\n", err)
+			return
+		}
+
+		vcnRes, _ = networkClient.GetVcn(ctx, vcnReq)
+		if len(vcnRes.Vcn.Ipv6CidrBlocks) > 0 {
+			vcnIPv6Prefix = vcnRes.Vcn.Ipv6CidrBlocks[0]
+			fmt.Printf("🎉 VCN IPv6 申请成功: %s\n", vcnIPv6Prefix)
+		} else {
+			fmt.Println("❌ VCN IPv6 申请未生效。")
+			return
+		}
+	}
+
+	if len(subRes.Subnet.Ipv6CidrBlocks) > 0 {
+		fmt.Printf("✅ 子网已配置 IPv6，CIDR 为: %s\n", subRes.Subnet.Ipv6CidrBlocks[0])
+	} else {
+		fmt.Println("⏳ 正在为子网划分并分配 IPv6 CIDR (/64)...")
+		prefixBase := strings.Split(vcnIPv6Prefix, "::/56")[0]
+		subnetIPv6Cidr := prefixBase + "::/64"
+
+		updateSubReq := core.UpdateSubnetRequest{
+			SubnetId: common.String(subnetID),
+			UpdateSubnetDetails: core.UpdateSubnetDetails{Ipv6CidrBlocks: []string{subnetIPv6Cidr}},
+		}
+
+		_, err = networkClient.UpdateSubnet(ctx, updateSubReq)
+		if err != nil {
+			fmt.Printf("❌ 为子网分配 IPv6 失败: %v\n", err)
+			return
+		}
+		fmt.Printf("🎉 子网 IPv6 分配成功: %s\n", subnetIPv6Cidr)
+	}
+
+	// 🚀 一条龙服务：自动触发路由与出站修复
+	fmt.Println("\n🔧 正在为您后台自动配置 IPv6 网关路由与出站安全规则...")
+	time.Sleep(2 * time.Second) 
+	updateRouteTable(subnetID)
+	updateSecurityList(subnetID, nil, "append") 
+
+	fmt.Println("\n👉 提示：IPv6 基础设施及路由已彻底打通！(如果需要入站端口全开，可直接选择菜单 3 执行)")
 }
