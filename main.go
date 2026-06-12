@@ -21,12 +21,13 @@ import (
 )
 
 var (
-	computeClient  core.ComputeClient
-	networkClient  core.VirtualNetworkClient
-	identityClient identity.IdentityClient
-	config         common.ConfigurationProvider
-	compartmentID  string
-	reader         = bufio.NewReader(os.Stdin)
+	computeClient      core.ComputeClient
+	networkClient      core.VirtualNetworkClient
+	identityClient     identity.IdentityClient
+	blockStorageClient core.BlockstorageClient // 用于查询硬盘容量
+	config             common.ConfigurationProvider
+	compartmentID      string
+	reader             = bufio.NewReader(os.Stdin)
 
 	// 👑 风控追踪变量
 	lastFailTime    time.Time
@@ -88,7 +89,7 @@ func main() {
 	// 3. 主菜单
 	for {
 		fmt.Println("\n====== 👑 主菜单 ======")
-		fmt.Println("1) 实例管理 (开关机 / 重启 / 彻底删除 / 换IP / 自动升级)")
+		fmt.Println("1) 实例管理 (开关机 / 重启 / 彻底删除 / 换IP / 自定义变配)")
 		fmt.Println("2) 自动抢机 (定时调度 / 随机延迟 / 防封禁 / 自动IPv6)")
 		fmt.Println("3) VCN 安全控制 (放行 IPv4/IPv6 端口 / 配置公网路由) 🛡️")
 		fmt.Println("0) 退出")
@@ -170,9 +171,40 @@ func initAuth() {
 
 	networkClient, err = core.NewVirtualNetworkClientWithConfigurationProvider(config)
 	identityClient, err = identity.NewIdentityClientWithConfigurationProvider(config)
+	blockStorageClient, err = core.NewBlockstorageClientWithConfigurationProvider(config)
+
+	if err != nil {
+		log.Fatalf("❌ 客户端初始化失败: %v", err)
+	}
 
 	compartmentID = tenancy
 	fmt.Println("✅ 身份验证已就绪，配置及私钥加载成功 (已开启动态指纹伪装)！")
+}
+
+// ============ 获取引导卷(硬盘)大小 ============
+func getBootVolumeSize(instanceID string, ad string) int64 {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 1. 查找挂载到该实例的引导卷
+	req := core.ListBootVolumeAttachmentsRequest{
+		AvailabilityDomain: common.String(ad), // 关键修复：API 强制要求必须带上可用区 AD
+		CompartmentId:      common.String(compartmentID),
+		InstanceId:         common.String(instanceID),
+	}
+	res, err := computeClient.ListBootVolumeAttachments(ctx, req)
+	if err != nil || len(res.Items) == 0 {
+		return 0
+	}
+	bootVolID := res.Items[0].BootVolumeId
+
+	// 2. 查询该引导卷的详细大小
+	bvReq := core.GetBootVolumeRequest{BootVolumeId: bootVolID}
+	bvRes, err := blockStorageClient.GetBootVolume(ctx, bvReq)
+	if err != nil || bvRes.BootVolume.SizeInGBs == nil {
+		return 0
+	}
+	return *bvRes.BootVolume.SizeInGBs
 }
 
 // ============ IPv6 查询与 IP 获取 ============
@@ -482,23 +514,72 @@ func instanceManagerMenu() {
 	}
 
 	var insID string
+	var selectedInstance core.Instance
+	var found bool
+
 	if idx, err := strconv.Atoi(input); err == nil && idx > 0 && idx <= len(activeInstances) {
-		insID = *activeInstances[idx-1].Id
-		fmt.Printf("\n✅ 已选中实例: %s\n", *activeInstances[idx-1].DisplayName)
+		selectedInstance = activeInstances[idx-1]
+		insID = *selectedInstance.Id
+		found = true
 	} else {
 		insID = input
 		if !strings.HasPrefix(insID, "ocid1.instance.") {
 			fmt.Println("❌ 无效输入，OCID 格式错误或序号超出范围。")
 			return
 		}
-		fmt.Println("\n✅ 已选中目标 OCID")
+		// 如果用户手动粘贴了 OCID，去云端单独查询这台机器的详情
+		req := core.GetInstanceRequest{InstanceId: common.String(insID)}
+		res, err := computeClient.GetInstance(context.Background(), req)
+		if err == nil {
+			selectedInstance = res.Instance
+			found = true
+		}
+	}
+
+	// 打印详细信息
+	if found {
+		fmt.Printf("\n✅ 已选中实例: %s\n", *selectedInstance.DisplayName)
+		
+		var cpu, ram float32
+		if selectedInstance.ShapeConfig != nil {
+			if selectedInstance.ShapeConfig.Ocpus != nil {
+				cpu = *selectedInstance.ShapeConfig.Ocpus
+			}
+			if selectedInstance.ShapeConfig.MemoryInGBs != nil {
+				ram = *selectedInstance.ShapeConfig.MemoryInGBs
+			}
+		}
+		fmt.Printf("🖥️  当前规格: %s\n", *selectedInstance.Shape)
+		fmt.Printf("⚙️  配置参数: %v 核 CPU | %v GB 内存\n", cpu, ram)
+		
+		// 获取并打印 IP 地址
+		ipv4, ipv6 := getInstanceIPs(insID)
+		fmt.Printf("🌐 公网 IPv4: %s\n", ipv4)
+		fmt.Printf("🌍 公网 IPv6: %s\n", ipv6)
+		
+		fmt.Print("⏳ 正在获取硬盘信息...")
+		
+		// 提取当前实例所在的可用区 (AD)，传给查询硬盘的函数
+		var adName string
+		if selectedInstance.AvailabilityDomain != nil {
+			adName = *selectedInstance.AvailabilityDomain
+		}
+		diskSize := getBootVolumeSize(insID, adName)
+		
+		if diskSize > 0 {
+			fmt.Printf("\r💾 硬盘容量: %d GB           \n", diskSize) // \r 会自动覆盖前方的“正在获取”提示
+		} else {
+			fmt.Printf("\r💾 硬盘容量: 获取失败 (可能是 API 权限不足)\n")
+		}
+	} else {
+		fmt.Println("\n✅ 已选中目标 OCID (未能获取到详细配置信息)")
 	}
 
 	fmt.Println("\n--- ⚙️ 实例控制中心 ---")
 	fmt.Println("1) 正常重启 (SOFTRESET)  2) 强制重启 (HARDRESET)")
 	fmt.Println("3) 启动实例 (START)      4) 停止实例 (STOP)")
 	fmt.Println("5) 彻底删除 (TERMINATE)  6) 🔄 自动换 IP (盲刷到通为止)")
-	fmt.Println("7) 🚀 自动盲刷升级 (1核6G 升级为 4核24G ARM)")
+	fmt.Println("7) 🚀 自定义变配 (手动输入核心与内存 / 缺货自动重试)")
 	fmt.Println("8) 📊 查看详细 IP 信息")
 	fmt.Println("9) 🌐 一键为实例分配公网 IPv4 与 IPv6 地址")
 	fmt.Print("请选择操作: ")
@@ -521,7 +602,20 @@ func instanceManagerMenu() {
 	case "6":
 		autoRotateIPUntilReachable(insID)
 	case "7":
-		autoUpgradeShape(insID)
+		fmt.Println("\n--- 🎛️ 实例自定义变配 ---")
+		fmt.Print("👉 请输入目标 OCPU 核心数 (例如 1, 2, 3, 4): ")
+		coresInput := readInput()
+		cores, err1 := strconv.ParseFloat(coresInput, 32)
+
+		fmt.Print("👉 请输入目标内存大小(GB) (例如 6, 12, 18, 24): ")
+		ramInput := readInput()
+		ram, err2 := strconv.ParseFloat(ramInput, 32)
+
+		if err1 != nil || err2 != nil || cores <= 0 || ram <= 0 {
+			fmt.Println("⚠️ 数值输入无效，操作取消。")
+		} else {
+			autoChangeShape(insID, float32(cores), float32(ram))
+		}
 	case "8":
 		getAllInstanceIPDetails(insID)
 	case "9":
@@ -774,12 +868,12 @@ type GrabConfig struct {
 	Cores, Memory                                                        float32
 	Disk                                                                 int64
 	MinDelay, MaxDelay                                                   int
-	BaseDelayMs                                                          int           
-	RetryLimit                                                           int           
-	ThrottleBackoffFactor                                                float64       
-	ResourceBackoffMin                                                   int           
-	ResourceBackoffMax                                                   int           
-	RequestTimeout                                                       time.Duration 
+	BaseDelayMs                                                          int            
+	RetryLimit                                                           int            
+	ThrottleBackoffFactor                                                float64        
+	ResourceBackoffMin                                                   int            
+	ResourceBackoffMax                                                   int            
+	RequestTimeout                                                       time.Duration  
 }
 
 func grabInstanceMenu() {
@@ -967,20 +1061,20 @@ func performLaunchInstance(conf GrabConfig) error {
 	return err
 }
 
-func autoUpgradeShape(instanceID string) {
-	fmt.Println("\n🚀 启动自动盲刷升级任务 (目标: 4核24G ARM)...")
-	fmt.Println("⚠️ 注意: 升级成功后实例会自动重启一次。请保持程序后台运行。")
+func autoChangeShape(instanceID string, targetCores float32, targetRam float32) {
+	fmt.Printf("\n🚀 启动自动盲刷变配任务 (目标: %v核 %vG ARM)...\n", targetCores, targetRam)
+	fmt.Println("⚠️ 注意: 变配成功后实例会自动重启一次。请保持程序后台运行。")
 
 	consecutiveFail = 0
 
 	for retryCount := 0; retryCount < 9999; retryCount++ {
-		fmt.Printf("\n[%s] 正在向甲骨文提交配置升级请求 #%d...", time.Now().Format("15:04:05"), retryCount+1)
+		fmt.Printf("\n[%s] 正在向甲骨文提交配置变配请求 #%d...", time.Now().Format("15:04:05"), retryCount+1)
 
 		details := core.UpdateInstanceDetails{
 			Shape: common.String("VM.Standard.A1.Flex"),
 			ShapeConfig: &core.UpdateInstanceShapeConfigDetails{
-				Ocpus:       common.Float32(4),
-				MemoryInGBs: common.Float32(24),
+				Ocpus:       common.Float32(targetCores),
+				MemoryInGBs: common.Float32(targetRam),
 			},
 		}
 
@@ -992,7 +1086,7 @@ func autoUpgradeShape(instanceID string) {
 		cancel()
 
 		if err == nil {
-			fmt.Println("\n🎉 [大吉大利] 恭喜！升级请求已被接受！机器正在重启并应用新配置。")
+			fmt.Println("\n🎉 [大吉大利] 恭喜！变配请求已被接受！机器正在重启并应用新配置。")
 			return
 		}
 
