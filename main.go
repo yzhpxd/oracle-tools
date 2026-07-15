@@ -539,7 +539,7 @@ func instanceManagerMenu() {
 	// 打印详细信息
 	if found {
 		fmt.Printf("\n✅ 已选中实例: %s\n", *selectedInstance.DisplayName)
-		
+
 		var cpu, ram float32
 		if selectedInstance.ShapeConfig != nil {
 			if selectedInstance.ShapeConfig.Ocpus != nil {
@@ -551,23 +551,23 @@ func instanceManagerMenu() {
 		}
 		fmt.Printf("🖥️  当前规格: %s\n", *selectedInstance.Shape)
 		fmt.Printf("⚙️  配置参数: %v 核 CPU | %v GB 内存\n", cpu, ram)
-		
+
 		// 获取并打印 IP 地址
 		ipv4, ipv6 := getInstanceIPs(insID)
 		fmt.Printf("🌐 公网 IPv4: %s\n", ipv4)
 		fmt.Printf("🌍 公网 IPv6: %s\n", ipv6)
-		
+
 		fmt.Print("⏳ 正在获取硬盘信息...")
-		
+
 		// 提取当前实例所在的可用区 (AD)，传给查询硬盘的函数
 		var adName string
 		if selectedInstance.AvailabilityDomain != nil {
 			adName = *selectedInstance.AvailabilityDomain
 		}
 		diskSize := getBootVolumeSize(insID, adName)
-		
+
 		if diskSize > 0 {
-			fmt.Printf("\r💾 硬盘容量: %d GB           \n", diskSize) // \r 会自动覆盖前方的“正在获取”提示
+			fmt.Printf("\r💾 硬盘容量: %d GB            \n", diskSize) // \r 会自动覆盖前方的“正在获取”提示
 		} else {
 			fmt.Printf("\r💾 硬盘容量: 获取失败 (可能是 API 权限不足)\n")
 		}
@@ -582,6 +582,8 @@ func instanceManagerMenu() {
 	fmt.Println("7) 🚀 自定义变配 (手动输入核心与内存 / 缺货自动重试)")
 	fmt.Println("8) 📊 查看详细 IP 信息")
 	fmt.Println("9) 🌐 一键为实例分配公网 IPv4 与 IPv6 地址")
+	fmt.Println("10) 🔄 救砖重装: Win11 彻底重装回原版 Ubuntu 20.04 (规避200G限额)")
+	fmt.Println("11) 💾 扩容硬盘 (仅支持增大，最高上限总和 200G)")
 	fmt.Print("请选择操作: ")
 
 	switch readInput() {
@@ -620,6 +622,10 @@ func instanceManagerMenu() {
 		getAllInstanceIPDetails(insID)
 	case "9":
 		assignIPv4AndIPv6(insID)
+	case "10":
+		rebuildToUbuntu2004(selectedInstance)
+	case "11":
+		resizeBootVolume(selectedInstance)
 	default:
 		fmt.Println("⚠️ 无效操作")
 	}
@@ -773,15 +779,15 @@ func autoCreateNetwork() string {
 			RouteTableId:  defaultRtID,
 		},
 	}
-	
+
 	time.Sleep(2 * time.Second)
-	
+
 	subnetRes, err := networkClient.CreateSubnet(ctx, subnetReq)
 	if err != nil {
 		fmt.Printf("❌ 创建子网失败: %v\n", err)
 		return ""
-	} 
-	
+	}
+
 	newSubnetID := *subnetRes.Subnet.Id
 	fmt.Printf("🎉 基础网络初始化大功告成！子网已就绪。\n👉 新子网 OCID: %s\n", newSubnetID)
 	return newSubnetID
@@ -802,7 +808,7 @@ func selectSubnet() string {
 				return newID
 			}
 		}
-		
+
 		fmt.Print("❌ 自动建网已跳过或失败，请手动粘贴 Subnet OCID (或输入 0 退出): ")
 		return readInput()
 	}
@@ -868,12 +874,12 @@ type GrabConfig struct {
 	Cores, Memory                                                        float32
 	Disk                                                                 int64
 	MinDelay, MaxDelay                                                   int
-	BaseDelayMs                                                          int            
-	RetryLimit                                                           int            
-	ThrottleBackoffFactor                                                float64        
-	ResourceBackoffMin                                                   int            
-	ResourceBackoffMax                                                   int            
-	RequestTimeout                                                       time.Duration  
+	BaseDelayMs                                                          int
+	RetryLimit                                                           int
+	ThrottleBackoffFactor                                                float64
+	ResourceBackoffMin                                                   int
+	ResourceBackoffMax                                                   int
+	RequestTimeout                                                       time.Duration
 }
 
 func grabInstanceMenu() {
@@ -1456,9 +1462,203 @@ func enableIPv6ForVCNAndSubnet(subnetID string) {
 
 	// 🚀 一条龙服务：自动触发路由与出站修复
 	fmt.Println("\n🔧 正在为您后台自动配置 IPv6 网关路由与出站安全规则...")
-	time.Sleep(2 * time.Second) 
+	time.Sleep(2 * time.Second)
 	updateRouteTable(subnetID)
-	updateSecurityList(subnetID, nil, "append") 
+	updateSecurityList(subnetID, nil, "append")
 
 	fmt.Println("\n👉 提示：IPv6 基础设施及路由已彻底打通！(如果需要入站端口全开，可直接选择菜单 3 执行)")
+}
+
+// ============ 实例重装回 Ubuntu 20.04 (防 200G 超额风控版) ============
+func rebuildToUbuntu2004(inst core.Instance) {
+	fmt.Println("\n=== 🔄 Win11 彻底重装回原版 Ubuntu 20.04 (删机重建法) ===")
+	fmt.Println("⚠️ 核心 API 限制警告：")
+	fmt.Println("甲骨文云 (OCI) 不允许在没有 Compute 实例的情况下，直接通过系统镜像创建引导卷。")
+	fmt.Println("因此，目前唯一能换回官方 Ubuntu 且【绝不超 200G 限额】的方法是：")
+	fmt.Println("1. 提取当前实例参数，随后连同 Win11 引导卷一起彻底删除。")
+	fmt.Println("2. 强制等待 2 分钟，确保云端底层彻底释放 200G 免费硬盘配额。")
+	fmt.Println("3. 自动调用本程序的【自动抢机模块】高频将原规格实例抢回来。")
+	fmt.Println("⚠️ 风险提示：在释放配额的 2 分钟内，您的 ARM 资源有极小概率被同区域的其他人截胡！")
+	fmt.Print("\n👉 确定要执行此危险操作吗？请在此输入大写 YES 确认: ")
+
+	if readInput() != "YES" {
+		fmt.Println("❌ 操作已取消。")
+		return
+	}
+
+	ctx := context.Background()
+	insID := *inst.Id
+
+	// 1. 获取基础网络与规格配置，为后续重建无缝衔接做准备
+	fmt.Println("\n⏳ [1/4] 正在提取当前实例的网络与规格参数，用于自动重建...")
+	var subnetID string
+	vnicReq := core.ListVnicAttachmentsRequest{
+		CompartmentId: common.String(compartmentID),
+		InstanceId:    common.String(insID),
+	}
+	vnicRes, err := computeClient.ListVnicAttachments(ctx, vnicReq)
+	if err == nil && len(vnicRes.Items) > 0 && vnicRes.Items[0].SubnetId != nil {
+		subnetID = *vnicRes.Items[0].SubnetId
+	} else {
+		fmt.Println("❌ 无法获取绑定的子网信息，重建配置缺失，操作已中止以保护您的实例。")
+		return
+	}
+
+	cpuShape := *inst.Shape
+	cores := float32(1.0)
+	ram := float32(1.0)
+	if inst.ShapeConfig != nil {
+		if inst.ShapeConfig.Ocpus != nil {
+			cores = *inst.ShapeConfig.Ocpus
+		}
+		if inst.ShapeConfig.MemoryInGBs != nil {
+			ram = *inst.ShapeConfig.MemoryInGBs
+		}
+	}
+	ad := *inst.AvailabilityDomain
+
+	// 匹配区域最新的 Ubuntu 20.04 镜像
+	fmt.Printf("⏳ 正在匹配当前架构 (%s) 的 Canonical Ubuntu 20.04 镜像...\n", cpuShape)
+	imgReq := core.ListImagesRequest{
+		CompartmentId:          common.String(compartmentID),
+		OperatingSystem:        common.String("Canonical Ubuntu"),
+		OperatingSystemVersion: common.String("20.04"),
+		Shape:                  common.String(cpuShape),
+		SortBy:                 core.ListImagesSortByTimecreated,
+		SortOrder:              core.ListImagesSortOrderDesc,
+		Limit:                  common.Int(1),
+	}
+	imgRes, err := computeClient.ListImages(ctx, imgReq)
+	if err != nil || len(imgRes.Items) == 0 {
+		fmt.Println("❌ 自动匹配 Ubuntu 镜像失败，请确认 API 权限或区域镜像库状态。")
+		return
+	}
+	imageID := *imgRes.Items[0].Id
+	fmt.Printf("✅ 匹配成功: %s\n", *imgRes.Items[0].DisplayName)
+
+	// 2. 彻底删除原实例与硬盘
+	fmt.Println("\n⏳ [2/4] 正在下发指令：彻底删除原实例与 Win11 引导卷...")
+	_, err = computeClient.TerminateInstance(ctx, core.TerminateInstanceRequest{
+		InstanceId:         common.String(insID),
+		PreserveBootVolume: common.Bool(false), // 绝对关键：这里必须是 false，连盘一起删
+	})
+	if err != nil {
+		fmt.Printf("❌ 删除失败: %v\n", err)
+		return
+	}
+
+	// 3. 强制等待配额释放
+	fmt.Println("\n⏳ [3/4] 实例已离线！防超额风控生效：强制休眠 120 秒，等待甲骨文云端清理 200GB 存储账单...")
+	for i := 120; i > 0; i-- {
+		fmt.Printf("\r倒计时: %d 秒...", i)
+		time.Sleep(1 * time.Second)
+	}
+	fmt.Println("\r✅ 配额刷新期结束！空间已清零。                                 ")
+
+	// 4. 交接给底层的抢机循环模块
+	fmt.Println("\n🚀 [4/4] 正在将配置注入高频抢机模块，尝试夺回实例资源...")
+	conf := GrabConfig{
+		InstanceName:          *inst.DisplayName + "-Recovered", // 自动给名字加后缀防重复
+		CPUType:               cpuShape,
+		ImageID:               imageID,
+		SubnetID:              subnetID,
+		ADName:                ad,
+		Cores:                 cores,
+		Memory:                ram,
+		Disk:                  50, // 恢复到健康的 50G
+		MinDelay:              3,  // 抢机延迟调低，尽快抢回
+		MaxDelay:              8,
+		BaseDelayMs:           300,
+		RetryLimit:            9999, // 盲刷直到抢到为止
+		ThrottleBackoffFactor: 2.0,
+		ResourceBackoffMin:    5,
+		ResourceBackoffMax:    15,
+	}
+
+	runTimedGrabLoop(conf)
+}
+// ============ 扩容实例硬盘 ============
+func resizeBootVolume(inst core.Instance) {
+	fmt.Println("\n=== 💾 实例硬盘扩容 ===")
+	fmt.Println("⚠️ 注意事项：")
+	fmt.Println("1. 甲骨文云 API 仅支持【扩大】硬盘，绝不支持【缩小】！")
+	fmt.Println("2. 免费层级 (Always Free) 的总硬盘限额是 200GB (包含所有实例总和)。")
+	fmt.Println("3. 扩容后，需要在服务器系统内部执行扩容命令才能生效。")
+
+	ctx := context.Background()
+	insID := *inst.Id
+	ad := *inst.AvailabilityDomain
+
+	// 1. 获取当前绑定的引导卷信息
+	fmt.Println("\n⏳ 正在查询当前硬盘大小...")
+	attachReq := core.ListBootVolumeAttachmentsRequest{
+		AvailabilityDomain: common.String(ad),
+		CompartmentId:      common.String(compartmentID),
+		InstanceId:         common.String(insID),
+	}
+	attachRes, err := computeClient.ListBootVolumeAttachments(ctx, attachReq)
+	if err != nil || len(attachRes.Items) == 0 {
+		fmt.Println("❌ 获取引导卷挂载记录失败，请检查实例是否正常运行。")
+		return
+	}
+
+	bootVolID := attachRes.Items[0].BootVolumeId
+	bvReq := core.GetBootVolumeRequest{BootVolumeId: bootVolID}
+	bvRes, err := blockStorageClient.GetBootVolume(ctx, bvReq)
+	if err != nil || bvRes.BootVolume.SizeInGBs == nil {
+		fmt.Println("❌ 无法读取当前硬盘详细信息。")
+		return
+	}
+
+	currentSize := *bvRes.BootVolume.SizeInGBs
+	fmt.Printf("✅ 找到引导卷 OCID: ...%s\n", (*bootVolID)[len(*bootVolID)-15:])
+	fmt.Printf("✅ 当前硬盘物理容量为: %d GB\n", currentSize)
+
+	// 2. 接收用户输入
+	fmt.Print("\n👉 请输入目标硬盘大小 (GB)，必须大于当前大小 (例如 100, 150, 200): ")
+	inputSizeStr := readInput()
+	newSize, err := strconv.ParseInt(inputSizeStr, 10, 64)
+	if err != nil {
+		fmt.Println("❌ 输入无效，请输入纯数字。")
+		return
+	}
+
+	// 安全校验
+	if newSize <= currentSize {
+		fmt.Printf("❌ 错误：目标大小 (%d GB) 必须严格大于当前大小 (%d GB)！\n", newSize, currentSize)
+		return
+	}
+	if newSize > 200 {
+		fmt.Println("⚠️ 警告：您设定的硬盘大小超过了 200GB！如果您是未升级的纯免费账户，这将会直接报错。")
+		fmt.Print("👉 确定要继续提交请求吗？(y/n): ")
+		if readInput() != "y" {
+			fmt.Println("❌ 已取消操作。")
+			return
+		}
+	}
+
+	// 3. 执行扩容
+	fmt.Printf("\n⏳ 正在向 Oracle 提交物理硬盘扩容请求 (%d GB -> %d GB)...\n", currentSize, newSize)
+	updateReq := core.UpdateBootVolumeRequest{
+		BootVolumeId: bootVolID,
+		UpdateBootVolumeDetails: core.UpdateBootVolumeDetails{
+			SizeInGBs: common.Int64(newSize),
+		},
+	}
+
+	_, err = blockStorageClient.UpdateBootVolume(ctx, updateReq)
+	if err != nil {
+		fmt.Printf("❌ 硬盘扩容 API 调用失败: %v\n", err)
+		return
+	}
+
+	fmt.Println("🎉 扩容请求已成功下发！云端后台正在为您分配存储空间。")
+	fmt.Println("👉 甲骨文云端扩容通常需要 1 分钟左右。")
+	
+	fmt.Println("\n=======================================================")
+	fmt.Println("🛠️ 【重要收尾操作】物理硬盘虽然变大了，但系统分区还没变大！")
+	fmt.Println("请在稍后 SSH 登录进服务器后，手动执行以下一键扩容命令：")
+	fmt.Println("Ubuntu 系统执行:  sudo /usr/libexec/oci-growfs")
+	fmt.Println("或者通用原生命令: sudo growpart /dev/sda 1 && sudo resize2fs /dev/sda1")
+	fmt.Println("=======================================================")
 }
