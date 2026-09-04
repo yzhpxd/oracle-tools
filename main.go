@@ -584,6 +584,8 @@ func instanceManagerMenu() {
 	fmt.Println("9) 🌐 一键为实例分配公网 IPv4 与 IPv6 地址")
 	fmt.Println("10) 🔄 救砖重装: Win11 彻底重装回原版 Ubuntu 20.04 (规避200G限额)")
 	fmt.Println("11) 💾 扩容硬盘 (仅支持增大，最高上限总和 200G)")
+	fmt.Println("12) 📸 创建系统备份 (Ghost 快照，免费最多保留 5 个)")
+	fmt.Println("13) ⏪ 从备份恢复系统 (自动删机重建，规避配额超限)")
 	fmt.Print("请选择操作: ")
 
 	switch readInput() {
@@ -626,6 +628,10 @@ func instanceManagerMenu() {
 		rebuildToUbuntu2004(selectedInstance)
 	case "11":
 		resizeBootVolume(selectedInstance)
+	case "12":
+		createBootVolumeBackup(selectedInstance)
+	case "13":
+		restoreFromBackup(selectedInstance)
 	default:
 		fmt.Println("⚠️ 无效操作")
 	}
@@ -869,17 +875,17 @@ func selectImage(cpuShape string) string {
 
 // ============ 风控感知的抢机配置与逻辑 ============
 type GrabConfig struct {
-	InstanceName                                                         string
-	CPUType, ImageID, SubnetID, ADName, RootPassword, StartTime, EndTime string
-	Cores, Memory                                                        float32
-	Disk                                                                 int64
-	MinDelay, MaxDelay                                                   int
-	BaseDelayMs                                                          int
-	RetryLimit                                                           int
-	ThrottleBackoffFactor                                                float64
-	ResourceBackoffMin                                                   int
-	ResourceBackoffMax                                                   int
-	RequestTimeout                                                       time.Duration
+	InstanceName                                                                       string
+	CPUType, ImageID, BootVolumeID, SubnetID, ADName, RootPassword, StartTime, EndTime string
+	Cores, Memory                                                                      float32
+	Disk                                                                               int64
+	MinDelay, MaxDelay                                                                 int
+	BaseDelayMs                                                                        int
+	RetryLimit                                                                         int
+	ThrottleBackoffFactor                                                              float64
+	ResourceBackoffMin                                                                 int
+	ResourceBackoffMax                                                                 int
+	RequestTimeout                                                                     time.Duration
 }
 
 func grabInstanceMenu() {
@@ -1030,6 +1036,20 @@ func runTimedGrabLoop(conf GrabConfig) {
 }
 
 func performLaunchInstance(conf GrabConfig) error {
+	var sourceDetails core.InstanceSourceDetails
+
+	// 💡 核心改动：如果传了 BootVolumeID，说明是快照恢复；否则是全新安装
+	if conf.BootVolumeID != "" {
+		sourceDetails = core.InstanceSourceViaBootVolumeDetails{
+			BootVolumeId: common.String(conf.BootVolumeID),
+		}
+	} else {
+		sourceDetails = core.InstanceSourceViaImageDetails{
+			ImageId:             common.String(conf.ImageID),
+			BootVolumeSizeInGBs: common.Int64(conf.Disk),
+		}
+	}
+
 	details := core.LaunchInstanceDetails{
 		AvailabilityDomain: common.String(conf.ADName),
 		CompartmentId:      common.String(compartmentID),
@@ -1039,10 +1059,7 @@ func performLaunchInstance(conf GrabConfig) error {
 			Ocpus:       common.Float32(conf.Cores),
 			MemoryInGBs: common.Float32(conf.Memory),
 		},
-		SourceDetails: core.InstanceSourceViaImageDetails{
-			ImageId:             common.String(conf.ImageID),
-			BootVolumeSizeInGBs: common.Int64(conf.Disk),
-		},
+		SourceDetails: sourceDetails,
 		CreateVnicDetails: &core.CreateVnicDetails{
 			SubnetId:     common.String(conf.SubnetID),
 			AssignIpv6Ip: common.Bool(true),
@@ -1577,6 +1594,7 @@ func rebuildToUbuntu2004(inst core.Instance) {
 
 	runTimedGrabLoop(conf)
 }
+
 // ============ 扩容实例硬盘 ============
 func resizeBootVolume(inst core.Instance) {
 	fmt.Println("\n=== 💾 实例硬盘扩容 ===")
@@ -1654,11 +1672,203 @@ func resizeBootVolume(inst core.Instance) {
 
 	fmt.Println("🎉 扩容请求已成功下发！云端后台正在为您分配存储空间。")
 	fmt.Println("👉 甲骨文云端扩容通常需要 1 分钟左右。")
-	
+
 	fmt.Println("\n=======================================================")
 	fmt.Println("🛠️ 【重要收尾操作】物理硬盘虽然变大了，但系统分区还没变大！")
 	fmt.Println("请在稍后 SSH 登录进服务器后，手动执行以下一键扩容命令：")
 	fmt.Println("Ubuntu 系统执行:  sudo /usr/libexec/oci-growfs")
 	fmt.Println("或者通用原生命令: sudo growpart /dev/sda 1 && sudo resize2fs /dev/sda1")
 	fmt.Println("=======================================================")
+}
+
+// ============ 引导卷与备份管理 ============
+
+// 辅助函数：获取实例绑定的引导卷 ID
+func getBootVolumeID(instanceID string, ad string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req := core.ListBootVolumeAttachmentsRequest{
+		AvailabilityDomain: common.String(ad),
+		CompartmentId:      common.String(compartmentID),
+		InstanceId:         common.String(instanceID),
+	}
+	res, err := computeClient.ListBootVolumeAttachments(ctx, req)
+	if err != nil || len(res.Items) == 0 {
+		return ""
+	}
+	return *res.Items[0].BootVolumeId
+}
+
+// 核心功能：创建引导卷快照备份
+func createBootVolumeBackup(inst core.Instance) {
+	fmt.Println("\n=== 📸 创建系统快照备份 (云端 Ghost) ===")
+	ad := *inst.AvailabilityDomain
+	bvID := getBootVolumeID(*inst.Id, ad)
+
+	if bvID == "" {
+		fmt.Println("❌ 获取引导卷失败，请检查实例是否正常运行。")
+		return
+	}
+
+	backupName := *inst.DisplayName + "-Backup-" + time.Now().Format("0102-1504")
+	fmt.Printf("⏳ 正在为硬盘下发备份指令 (备份名: %s)...\n", backupName)
+
+	req := core.CreateBootVolumeBackupRequest{
+		CreateBootVolumeBackupDetails: core.CreateBootVolumeBackupDetails{
+			BootVolumeId: common.String(bvID),
+			DisplayName:  common.String(backupName),
+			Type:         core.CreateBootVolumeBackupDetailsTypeFull,
+		},
+	}
+
+	_, err := blockStorageClient.CreateBootVolumeBackup(context.Background(), req)
+	if err != nil {
+		fmt.Printf("❌ 创建备份失败: %v\n", err)
+		return
+	}
+
+	fmt.Println("🎉 备份指令下发成功！甲骨文云端正在后台悄悄打包。")
+	fmt.Println("👉 提示：由于是热备份，完全不影响您的服务器运行。您可以在网页端查看备份进度。")
+}
+
+// 核心功能：从快照备份无损恢复
+func restoreFromBackup(inst core.Instance) {
+	fmt.Println("\n=== ⏪ 从系统备份恢复 (规避风控法) ===")
+	ctx := context.Background()
+
+	// 1. 获取现有备份列表
+	fmt.Println("⏳ 正在拉取您账号下的系统快照列表...")
+	req := core.ListBootVolumeBackupsRequest{
+		CompartmentId:  common.String(compartmentID),
+		LifecycleState: core.BootVolumeBackupLifecycleStateAvailable,
+	}
+	res, err := blockStorageClient.ListBootVolumeBackups(ctx, req)
+	if err != nil || len(res.Items) == 0 {
+		fmt.Println("❌ 您的账号下没有发现任何可用的快照备份！请先使用 [选项12] 制作备份。")
+		return
+	}
+
+	var availableBackups []core.BootVolumeBackup
+	fmt.Println("\n=== 📸 可用快照备份列表 ===")
+	for i, backup := range res.Items {
+		fmt.Printf("[%d] %s | 容量: %vGB | 时间: %s\n", i+1, *backup.DisplayName, *backup.SizeInGBs, backup.TimeCreated.Format("2006-01-02 15:04"))
+		availableBackups = append(availableBackups, backup)
+	}
+
+	fmt.Print("\n👉 请输入要恢复的备份 [序号] (输入 0 取消): ")
+	input := readInput()
+	idx, err := strconv.Atoi(input)
+	if err != nil || idx < 1 || idx > len(availableBackups) {
+		fmt.Println("❌ 操作已取消。")
+		return
+	}
+	selectedBackup := availableBackups[idx-1]
+	backupID := *selectedBackup.Id
+	backupName := *selectedBackup.DisplayName
+
+	// 2. 参数提取与风险确认
+	fmt.Println("\n⚠️ 核心警告：")
+	fmt.Println("甲骨文免费账号总硬盘限额为 200GB。如果您在不删原机的情况下恢复备份，大概率会因超出限额而报错。")
+	fmt.Println("本工具将执行全自动流水线操作：")
+	fmt.Println("1) 提取当前实例参数并【彻底删除】当前实例和它的系统盘。")
+	fmt.Println("2) 从所选快照克隆出一个全新的系统盘。")
+	fmt.Println("3) 呼叫【抢机模块】原地复活，用新系统盘装回原机器配置中。")
+	fmt.Print("\n👉 确定要执行此操作吗？请在此输入大写 YES 确认: ")
+	if readInput() != "YES" {
+		fmt.Println("❌ 操作已取消。")
+		return
+	}
+
+	insID := *inst.Id
+	cpuShape := *inst.Shape
+	cores, ram := float32(1.0), float32(1.0)
+	if inst.ShapeConfig != nil {
+		if inst.ShapeConfig.Ocpus != nil {
+			cores = *inst.ShapeConfig.Ocpus
+		}
+		if inst.ShapeConfig.MemoryInGBs != nil {
+			ram = *inst.ShapeConfig.MemoryInGBs
+		}
+	}
+	ad := *inst.AvailabilityDomain
+
+	var subnetID string
+	vnicReq := core.ListVnicAttachmentsRequest{CompartmentId: common.String(compartmentID), InstanceId: common.String(insID)}
+	vnicRes, _ := computeClient.ListVnicAttachments(ctx, vnicReq)
+	if len(vnicRes.Items) > 0 && vnicRes.Items[0].SubnetId != nil {
+		subnetID = *vnicRes.Items[0].SubnetId
+	} else {
+		fmt.Println("❌ 无法提取当前网络配置，恢复操作已保护性中止。")
+		return
+	}
+
+	// 3. 删除旧机器
+	fmt.Println("\n⏳ [1/4] 正在下发指令：彻底删除原实例与引导卷以释放免费配额...")
+	_, err = computeClient.TerminateInstance(ctx, core.TerminateInstanceRequest{
+		InstanceId:         common.String(insID),
+		PreserveBootVolume: common.Bool(false), // 必须为false，连盘一起删
+	})
+	if err != nil {
+		fmt.Printf("❌ 删除失败: %v\n", err)
+		return
+	}
+
+	// 4. 等待配额刷新
+	fmt.Println("\n⏳ [2/4] 强制休眠 60 秒，等待甲骨文云端清理存储账单 (防止 200G 额度未释放报错)...")
+	for i := 60; i > 0; i-- {
+		fmt.Printf("\r倒计时: %d 秒...", i)
+		time.Sleep(1 * time.Second)
+	}
+
+	// 5. 从快照克隆硬盘
+	fmt.Println("\n\n⏳ [3/4] 正在从备份快照合成新的硬盘 (这可能需要 1~3 分钟)...")
+	newBootVolReq := core.CreateBootVolumeRequest{
+		CreateBootVolumeDetails: core.CreateBootVolumeDetails{
+			AvailabilityDomain: common.String(ad),
+			CompartmentId:      common.String(compartmentID),
+			DisplayName:        common.String(backupName + "-Restored"),
+			SourceDetails:      core.BootVolumeSourceFromBootVolumeBackupDetails{Id: common.String(backupID)},
+		},
+	}
+	newBootVolRes, err := blockStorageClient.CreateBootVolume(ctx, newBootVolReq)
+	if err != nil {
+		fmt.Printf("❌ 硬盘恢复失败: %v\n🚨 请登录网页端手动通过备份创建实例！\n", err)
+		return
+	}
+	newBootVolumeID := *newBootVolRes.BootVolume.Id
+
+	// 轮询检查硬盘合成状态
+	waitSec := 0
+	for {
+		bvRes, _ := blockStorageClient.GetBootVolume(ctx, core.GetBootVolumeRequest{BootVolumeId: common.String(newBootVolumeID)})
+		if bvRes.BootVolume.LifecycleState == core.BootVolumeLifecycleStateAvailable {
+			break
+		}
+		waitSec += 5
+		fmt.Printf("\r⏳ 已等待 %d 秒，云端正在合成数据...", waitSec)
+		time.Sleep(5 * time.Second)
+	}
+
+	// 6. 调用底层抢机模块原地复活
+	fmt.Println("\n✅ 硬盘克隆完毕！")
+	fmt.Println("🚀 [4/4] 正在呼叫抢机模块，将系统挂载回原规格机器...")
+
+	conf := GrabConfig{
+		InstanceName:          *inst.DisplayName + "-Restored",
+		CPUType:               cpuShape,
+		BootVolumeID:          newBootVolumeID, // 核心：让机器从这个新盘启动
+		SubnetID:              subnetID,
+		ADName:                ad,
+		Cores:                 cores,
+		Memory:                ram,
+		MinDelay:              3,
+		MaxDelay:              8,
+		BaseDelayMs:           300,
+		RetryLimit:            9999,
+		ThrottleBackoffFactor: 2.0,
+		ResourceBackoffMin:    5,
+		ResourceBackoffMax:    15,
+	}
+
+	runTimedGrabLoop(conf)
 }
